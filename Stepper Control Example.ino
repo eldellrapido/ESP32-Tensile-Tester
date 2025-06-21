@@ -7,6 +7,7 @@ Core 1: OLED display, button handling, user interface
 
 #include <SPI.h>
 #include <Wire.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 
@@ -384,7 +385,7 @@ void updateDisplay() {
   float outputDegrees = (totalSteps / outputStepsPerRev) * 360.0;
   display.setCursor(0, 48);
   display.print("Angle: ");
-  display.print(fmod(outputDegrees, 360.0), 1);
+  display.print(fmodf(outputDegrees, 360.0f), 1);
   display.print("°");
   
   // Controls
