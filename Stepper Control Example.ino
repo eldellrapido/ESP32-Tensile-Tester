@@ -77,7 +77,6 @@ const uint32_t modeSpeeds[] = {
 
 TestMode currentMode = MODE_STOPPED;
 unsigned long lastDisplayUpdate = 0;
-unsigned long lastButtonCheck = 0;
 
 // ===== HARDWARE TIMER INTERRUPT =====
 
@@ -262,30 +261,33 @@ void showStartup() {
 
 void handleButtons() {
   unsigned long now = millis();
-  
+
   // Read current button states
   bool buttonA = !digitalRead(BUTTON_A);
   bool buttonB = !digitalRead(BUTTON_B);
   bool buttonC = !digitalRead(BUTTON_C);
-  
+
   // Static variables to track previous button states for edge detection
   static bool lastButtonA = false;
   static bool lastButtonB = false;
   static bool lastButtonC = false;
-  
-  // Debounce - only check buttons every 100ms
-  if (now - lastButtonCheck < 100) return;
-  
+
+  // Independent timestamps for debouncing
+  static unsigned long lastButtonATime = 0;
+  static unsigned long lastButtonBTime = 0;
+  static unsigned long lastButtonCTime = 0;
+  const unsigned long debounce = 100;  // 100ms debounce per button
+
   // Button A - Mode change (on press, not hold)
-  if (buttonA && !lastButtonA) {
+  if (buttonA && !lastButtonA && (now - lastButtonATime > debounce)) {
     currentMode = (TestMode)((currentMode + 1) % MODE_COUNT);
     Serial.print("Mode changed to: ");
     Serial.println(modeNames[currentMode]);
-    lastButtonCheck = now;
+    lastButtonATime = now;
   }
-  
+
   // Button B - Start/Stop toggle (on press, not hold)
-  if (buttonB && !lastButtonB) {
+  if (buttonB && !lastButtonB && (now - lastButtonBTime > debounce)) {
     moveStepper = !moveStepper;
     if (moveStepper) {
       stepsTaken = 0;  // Reset step counter
@@ -294,17 +296,17 @@ void handleButtons() {
     } else {
       Serial.println("Motor stopped");
     }
-    lastButtonCheck = now;
+    lastButtonBTime = now;
   }
-  
+
   // Button C - Direction change (on press, not hold)
-  if (buttonC && !lastButtonC) {
+  if (buttonC && !lastButtonC && (now - lastButtonCTime > debounce)) {
     stepperDir = !stepperDir;
     Serial.print("Direction changed to: ");
     Serial.println(stepperDir ? "CW" : "CCW");
-    lastButtonCheck = now;
+    lastButtonCTime = now;
   }
-  
+
   // Update previous button states
   lastButtonA = buttonA;
   lastButtonB = buttonB;
