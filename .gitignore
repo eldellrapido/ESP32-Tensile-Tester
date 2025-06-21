@@ -1,0 +1,11 @@
+# Arduino build output directories
+build/
+*.pio/
+
+# Firmware binaries
+*.elf
+*.bin
+*.hex
+
+# Logs
+*.log
