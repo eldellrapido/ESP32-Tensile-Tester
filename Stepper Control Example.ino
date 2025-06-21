@@ -39,6 +39,8 @@ volatile uint32_t stepperSpeed = 1000;  // Steps per second
 volatile bool stepperDir = true;
 volatile uint16_t stepsTaken = 0;       // Keep this small - reset at motor rev
 volatile uint16_t totalRotations = 0;   // Track rotations separately
+// Motor driver enable state.
+// Hold Button B for >1s to toggle this at runtime.
 volatile bool motorEnabled = true;
 volatile bool stepState = false;
 volatile uint32_t interruptCount = 0;   // Debug: count timer interrupts
@@ -185,7 +187,7 @@ void setup() {
   Serial.println();
   Serial.println("Controls:");
   Serial.println("Button A: Change mode/speed (SLOW→MEDIUM→FAST→ULTRA→LUDICROUS)");
-  Serial.println("Button B: Start/Stop motor (TOGGLE - single press)");
+  Serial.println("Button B: Start/Stop (tap), Enable/Disable (hold)");
   Serial.println("Button C: Change direction (TOGGLE - single press)");
   Serial.println();
   Serial.println("Speed modes:");
@@ -272,11 +274,18 @@ void handleButtons() {
   static bool lastButtonB = false;
   static bool lastButtonC = false;
 
+
   // Independent timestamps for debouncing
   static unsigned long lastButtonATime = 0;
   static unsigned long lastButtonBTime = 0;
   static unsigned long lastButtonCTime = 0;
   const unsigned long debounce = 100;  // 100ms debounce per button
+
+  static unsigned long buttonBPressTime = 0;  // For long-press detection
+  
+  // Debounce - only check buttons every 100ms
+  if (now - lastButtonCheck < 100) return;
+  
 
   // Button A - Mode change (on press, not hold)
   if (buttonA && !lastButtonA && (now - lastButtonATime > debounce)) {
@@ -286,6 +295,7 @@ void handleButtons() {
     lastButtonATime = now;
   }
 
+
   // Button B - Start/Stop toggle (on press, not hold)
   if (buttonB && !lastButtonB && (now - lastButtonBTime > debounce)) {
     moveStepper = !moveStepper;
@@ -293,8 +303,26 @@ void handleButtons() {
       stepsTaken = 0;  // Reset step counter
       totalRotations = 0;  // Reset rotation counter
       Serial.println("Motor started - counters reset");
+
+  
+  // Button B - short press: start/stop, long press (>1s): toggle driver enable
+  if (buttonB && !lastButtonB) {
+    buttonBPressTime = now;  // record press
+  }
+  if (!buttonB && lastButtonB) {
+    if (now - buttonBPressTime >= 1000) {
+      motorEnabled = !motorEnabled;
+      Serial.println(motorEnabled ? "Motor driver enabled" : "Motor driver disabled");
+
     } else {
-      Serial.println("Motor stopped");
+      moveStepper = !moveStepper;
+      if (moveStepper) {
+        stepsTaken = 0;  // Reset step counter
+        totalRotations = 0;  // Reset rotation counter
+        Serial.println("Motor started - counters reset");
+      } else {
+        Serial.println("Motor stopped");
+      }
     }
     lastButtonBTime = now;
   }
