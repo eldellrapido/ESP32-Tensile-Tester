@@ -1,0 +1,2752 @@
+/*
+ESP32 Universal Testing Machine - UTM_REV3
+- NeoKeys 1x4 mechanical RGB input with ultra-responsive handling
+- 128x128 grayscale OLED display with optimized I2C usage
+- Dedicated high-priority button task (1000Hz on Core 0)
+- Optimized I2C bus management to prevent congestion
+- Smart LED updates only when needed to reduce bus traffic
+- Ultimate and Modulus test modes with 80Hz data acquisition
+*/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1327.h>
+#include <EEPROM.h>
+#include "driver/gpio.h"
+#include "soc/gpio_reg.h"
+#include "SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h"
+#include "Adafruit_NeoKey_1x4.h"
+#include "seesaw_neopixel.h"
+
+// ===== HARDWARE CONFIGURATION =====
+// Display - 128x128 Grayscale OLED (SSD1327)
+Adafruit_SSD1327 display(128, 128, &Wire, -1, 400000);
+
+// Load Cell
+NAU7802 myScale;
+
+// Gain tracking (since NAU7802 library doesn't expose getGain())
+uint8_t currentGainSetting = 16; // Default gain
+
+// ===== FUNCTION DECLARATIONS =====
+uint8_t getCurrentGain();
+
+// NeoKeys 1x4 - RGB Mechanical Keys
+Adafruit_NeoKey_1x4 neokey;
+
+// GPIO Pins
+const int DIR = 16;
+const int STEP = 15;
+const int EN = 14;
+
+// Motor Parameters
+const int MICRO_STEPS = 8;
+const int GEAR_RATIO = 50;
+const int MOTOR_STEPS_PER_REV = 200 * MICRO_STEPS;
+const int OUTPUT_STEPS_PER_REV = MOTOR_STEPS_PER_REV * GEAR_RATIO;
+
+// Mechanical Parameters
+const float MM_PER_REV = 8.0f;
+const float MM_PER_STEP = MM_PER_REV / OUTPUT_STEPS_PER_REV;
+
+// EEPROM Configuration (matching SparkFun examples)
+#define EEPROM_SIZE 100
+#define LOCATION_CALIBRATION_FACTOR 0
+#define LOCATION_ZERO_OFFSET 10
+#define LOCATION_SETTINGS_VALID 20
+#define LOCATION_GAIN_SETTING 30  // New location for gain persistence
+
+// ===== NEOKEYS CONFIGURATION =====
+// Button definitions
+#define BTN_NAV_LEFT    0  // Navigation left/jog reverse
+#define BTN_NAV_RIGHT   1  // Navigation right/jog forward  
+#define BTN_ENTER       2  // Enter/Start (green)
+#define BTN_EXIT        3  // Exit/Stop (red)
+
+// LED Colors (RGB values)
+#define COLOR_WHITE     0xFFD080    // Warmer yellow-white
+#define COLOR_GREEN     0x00FF00
+#define COLOR_RED       0xFF0000
+#define COLOR_OFF       0x000000
+#define COLOR_DIM_WHITE 0x806040    // Dimmed warm yellow-white
+#define COLOR_ORANGE    0xFF4500
+#define COLOR_BLUE      0x0066FF
+
+// ===== LOAD CELL CONFIGURATION CLASS =====
+class LoadCellConfig {
+public:
+    static const uint8_t DEFAULT_GAIN = 16;
+    static const uint8_t SAMPLE_RATE = 80;  // Hz
+    static const uint8_t CALIBRATION_SAMPLES = 64;
+    static const uint16_t MAX_WAIT_MS = 50;  // Max wait for data availability
+    static constexpr float SATURATION_THRESHOLD = 8000000.0f;  // 24-bit ADC near max
+    static constexpr float MAX_REASONABLE_WEIGHT_KG = 1000.0f;  // Sanity check
+};
+
+// ===== ENUMS =====
+enum SystemState {
+    STATE_MENU_MAIN,
+    STATE_MENU_LOAD_CELL,
+    STATE_JOG,
+    STATE_TEST_CONFIRM,
+    STATE_TEST,
+    STATE_ULTIMATE_RESULT
+};
+
+enum TestMode {
+    TEST_ULTIMATE = 0,
+    TEST_MODULUS = 1,
+    TEST_FATIGUE = 2,
+    TEST_CREEP = 3
+};
+
+// ===== DATA STRUCTURES =====
+struct TestDataPoint {
+    uint64_t timestamp_us;
+    float force_N;
+    float position_mm;
+    uint32_t step_count;
+    bool valid;
+};
+
+struct LiveTestData {
+    float currentForce_N;
+    float peakForce_N;
+    float peakForcePosition_mm;  // Position where peak occurred
+    float currentPosition_mm;
+    float testStartPosition_mm;
+    uint32_t totalSteps;
+    uint64_t testStartTime_us;
+    uint64_t testEndTime_us;     // Time when test ended
+    uint64_t peakForceTime_us;   // Time when peak occurred
+    bool testActive;
+    bool scaleCalibrated;
+    bool bufferOverflow;
+    bool sensorSaturated;
+    bool scaleError;
+    bool positionReset;
+    
+    // Simple break detection
+    uint32_t forceDropCounter;    // Frames below 50% threshold
+};
+
+// ===== GLOBAL VARIABLES =====
+// Data Buffer - Rolling buffer for Ultimate, full buffer for Modulus
+#define BUFFER_SIZE 2000
+#define ROLLING_BUFFER_SIZE 500  // Keep only recent data for Ultimate mode
+#define MAX_TEST_DURATION_POINTS_MODULUS (BUFFER_SIZE * 25)  // ~10 minutes at 80Hz for Modulus
+// Ultimate mode has no time limit due to rolling buffer
+TestDataPoint dataBuffer[BUFFER_SIZE];
+volatile uint16_t bufferWriteIndex = 0;
+volatile bool bufferWrapped = false;
+volatile uint32_t totalDataPoints = 0;
+
+// Live Data
+LiveTestData liveData = {0};
+
+// FreeRTOS
+EventGroupHandle_t testEventFlags;
+#define EVT_TEST_START       (1 << 0)
+#define EVT_TEST_STOP        (1 << 1)
+#define EVT_CALIBRATE_START  (1 << 2)
+#define EVT_CALIBRATE_DONE   (1 << 3)
+#define EVT_TARE_REQUEST     (1 << 4)
+#define EVT_DATA_READY       (1 << 5)
+
+// Hardware Timer
+hw_timer_t* stepTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Motor Control (volatile for ISR access)
+volatile bool moveStepper = false;
+volatile uint32_t stepperSpeed = 1000;
+volatile bool stepperDir = true;  // FIXED: true = away from fixed jaw (tensile)
+volatile uint32_t stepsTaken = 0;
+volatile uint16_t totalRotations = 0;
+volatile bool motorEnabled = true;
+volatile bool stepState = false;
+volatile bool timerRunning = false;
+volatile int32_t jogStepCounter = 0;
+
+// Task Handles
+TaskHandle_t uiTaskHandle = NULL;
+TaskHandle_t dataTaskHandle = NULL;
+TaskHandle_t neokeyTaskHandle = NULL;
+
+// UI State
+SystemState currentState = STATE_MENU_MAIN;
+uint8_t menuIndex = 0;
+float jogDistanceMM = 0.0f;
+
+// Configuration - Updated test rates to 5mm/min and 1mm/min
+float testRateOptions_mmpm[] = {5.0f, 1.0f}; // mm per minute
+uint8_t testRateIndex = 0;
+float jogRateOptions[] = {0.2f, 0.4f, 0.8f};
+uint8_t jogRateIndex = 0;
+TestMode currentTestMode = TEST_ULTIMATE;
+const uint8_t mainMenuItemCount = 6;
+const uint8_t loadCellMenuItemCount = 1; // Only tare now
+
+// Button State
+struct ButtonState {
+    bool current;
+    bool last;
+    unsigned long lastChangeTime;
+};
+ButtonState buttons[4];
+
+// ===== LOAD CELL MANAGER CLASS =====
+class LoadCellManager {
+private:
+    bool initialized = false;
+    uint32_t lastErrorTime = 0;
+    uint32_t consecutiveErrors = 0;
+    
+public:
+    bool initialize() {
+        Serial.println("Initializing NAU7802 load cell...");
+        
+        // Initialize I2C
+        Wire.begin();
+        Wire.setClock(400000);
+        
+        if (!myScale.begin()) {
+            Serial.println("❌ NAU7802 not detected - check wiring");
+            return false;
+        }
+        
+        Serial.println("✓ NAU7802 detected");
+        
+        // Configure in proper sequence
+        if (!configure()) {
+            Serial.println("❌ NAU7802 configuration failed");
+            return false;
+        }
+        
+        initialized = true;
+        Serial.println("✓ NAU7802 initialized successfully");
+        return true;
+    }
+    
+    bool configure() {
+        // Set gain (16x is stable default)
+        myScale.setGain(NAU7802_GAIN_16);
+        currentGainSetting = 16; // Track the gain setting
+        
+        // Set sample rate for 80Hz
+        myScale.setSampleRate(NAU7802_SPS_80);
+        
+        // Set LDO voltage
+        myScale.setLDO(NAU7802_LDO_3V0);
+        
+        // CRITICAL: Calibrate AFE after configuration changes
+        Serial.println("Calibrating AFE...");
+        if (!myScale.calibrateAFE()) {
+            Serial.println("AFE calibration failed");
+            return false;
+        }
+        
+        // Wait for stabilization
+        delay(500);
+        
+        Serial.println("✓ NAU7802 configured: 16x gain, 80 SPS, 3.0V LDO");
+        return true;
+    }
+    
+    bool loadCalibration() {
+        if (!initialized) return false;
+        
+        float calibrationFactor;
+        int32_t zeroOffset;
+        uint8_t savedGain;
+        bool settingsValid;
+        
+        // Load settings valid flag
+        EEPROM.get(LOCATION_SETTINGS_VALID, settingsValid);
+        if (!settingsValid) {
+            Serial.println("No valid calibration found in EEPROM");
+            return false;
+        }
+        
+        // Load calibration factor
+        EEPROM.get(LOCATION_CALIBRATION_FACTOR, calibrationFactor);
+        if (isnan(calibrationFactor) || calibrationFactor <= 0) {
+            Serial.println("Invalid calibration factor in EEPROM");
+            return false;
+        }
+        
+        // Load zero offset
+        EEPROM.get(LOCATION_ZERO_OFFSET, zeroOffset);
+        
+        // Load gain setting (with validation)
+        EEPROM.get(LOCATION_GAIN_SETTING, savedGain);
+        if (savedGain != 1 && savedGain != 2 && savedGain != 4 && savedGain != 8 && 
+            savedGain != 16 && savedGain != 32 && savedGain != 64 && savedGain != 128) {
+            Serial.printf("Invalid gain %d in EEPROM, defaulting to 16x\n", savedGain);
+            savedGain = 16;
+        }
+        
+        // Restore gain setting
+        switch (savedGain) {
+            case 1: myScale.setGain(NAU7802_GAIN_1); break;
+            case 2: myScale.setGain(NAU7802_GAIN_2); break;
+            case 4: myScale.setGain(NAU7802_GAIN_4); break;
+            case 8: myScale.setGain(NAU7802_GAIN_8); break;
+            case 16: myScale.setGain(NAU7802_GAIN_16); break;
+            case 32: myScale.setGain(NAU7802_GAIN_32); break;
+            case 64: myScale.setGain(NAU7802_GAIN_64); break;
+            case 128: myScale.setGain(NAU7802_GAIN_128); break;
+            default: myScale.setGain(NAU7802_GAIN_16); savedGain = 16; break;
+        }
+        currentGainSetting = savedGain;
+        
+        // CRITICAL: Recalibrate AFE after restoring gain
+        if (!myScale.calibrateAFE()) {
+            Serial.println("⚠️  AFE calibration failed after restoring gain");
+        }
+        
+        // Apply calibration values
+        myScale.setCalibrationFactor(calibrationFactor);
+        myScale.setZeroOffset(zeroOffset);
+        
+        Serial.printf("✓ Loaded calibration: factor=%.3f, offset=%ld, gain=%dx\n", 
+                      calibrationFactor, zeroOffset, savedGain);
+        
+        return true;
+    }
+    
+    void saveCalibration() {
+        if (!initialized) return;
+        
+        EEPROM.put(LOCATION_CALIBRATION_FACTOR, myScale.getCalibrationFactor());
+        EEPROM.put(LOCATION_ZERO_OFFSET, myScale.getZeroOffset());
+        EEPROM.put(LOCATION_GAIN_SETTING, currentGainSetting); // Save gain setting
+        
+        bool settingsValid = true;
+        EEPROM.put(LOCATION_SETTINGS_VALID, settingsValid);
+        
+        EEPROM.commit();
+        Serial.printf("✓ Calibration saved to EEPROM (Factor: %.3f, Offset: %ld, Gain: %dx)\n", 
+                     myScale.getCalibrationFactor(), myScale.getZeroOffset(), currentGainSetting);
+    }
+    
+    bool performCalibration() {
+        if (!initialized) {
+            Serial.println("Load cell not initialized");
+            return false;
+        }
+        
+        Serial.println("\n=== LOAD CELL CALIBRATION ===");
+        Serial.println("This load cell supports both TENSION and COMPRESSION");
+        
+        // Step 1: Zero calibration
+        Serial.println("Step 1: Remove all weight/load from load cell");
+        Serial.println("Press Enter when ready...");
+        waitForUserInput();
+        
+        Serial.println("Zeroing scale (64 samples)...");
+        
+        // Calculate zero offset manually for better reliability
+        int32_t zeroTotal = 0;
+        int zeroValidReadings = 0;
+        
+        for (int i = 0; i < LoadCellConfig::CALIBRATION_SAMPLES; i++) {
+            delay(50);
+            if (myScale.available()) {
+                int32_t reading = myScale.getReading();
+                zeroTotal += reading;
+                zeroValidReadings++;
+                
+                if (i % 16 == 0) {
+                    Serial.printf("  Zero reading %d/%d: %ld\n", i+1, LoadCellConfig::CALIBRATION_SAMPLES, reading);
+                }
+            }
+        }
+        
+        if (zeroValidReadings < LoadCellConfig::CALIBRATION_SAMPLES / 2) {
+            Serial.println("❌ Not enough readings for zero calibration");
+            return false;
+        }
+        
+        int32_t zeroOffset = zeroTotal / zeroValidReadings;
+        myScale.setZeroOffset(zeroOffset);
+        Serial.printf("Zero offset: %ld (from %d readings)\n", zeroOffset, zeroValidReadings);
+        
+        // Step 2: Weight calibration
+        Serial.println("\nStep 2: Apply known load to load cell");
+        Serial.println("For TENSION: Hang a known weight (e.g., 20kg)");
+        Serial.println("For COMPRESSION: Place/push known weight (e.g., 20kg)");
+        Serial.println("Press Enter when load is stable...");
+        waitForUserInput();
+        
+        Serial.print("Enter load value (e.g., 20 for 20kg): ");
+        
+        // Better serial input handling
+        String weightStr = "";
+        while (Serial.available()) Serial.read(); // Clear buffer
+        
+        while (weightStr.length() == 0) {
+            while (Serial.available() == 0) {
+                delay(10);
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            
+            weightStr = Serial.readStringUntil('\n');
+            weightStr.trim();
+            
+            if (weightStr.length() == 0) {
+                Serial.print("Please enter a load value: ");
+            }
+        }
+        
+        float knownWeight = weightStr.toFloat();
+        
+        if (knownWeight <= 0) {
+            Serial.println("❌ Invalid weight value");
+            return false;
+        }
+        
+        Serial.printf("Calibrating with %.2f units...\n", knownWeight);
+        
+        // Take multiple readings and average them manually (more reliable than library)
+        Serial.println("Taking calibration readings...");
+        int32_t total = 0;
+        int validReadings = 0;
+        
+        for (int i = 0; i < LoadCellConfig::CALIBRATION_SAMPLES; i++) {
+            delay(50); // Give time between readings
+            if (myScale.available()) {
+                int32_t reading = myScale.getReading();
+                total += reading;
+                validReadings++;
+                
+                if (i % 16 == 0) { // Progress indicator
+                    Serial.printf("  Reading %d/%d: %ld\n", i+1, LoadCellConfig::CALIBRATION_SAMPLES, reading);
+                }
+            }
+        }
+        
+        if (validReadings < LoadCellConfig::CALIBRATION_SAMPLES / 2) {
+            Serial.println("❌ Not enough valid readings for calibration");
+            return false;
+        }
+        
+        // Calculate average and calibration factor manually
+        float averageReading = (float)total / validReadings;
+        // FLIPPED: Negate to reverse direction
+        float calibrationFactor = -((averageReading - zeroOffset) / knownWeight);
+        
+        Serial.printf("Average reading: %.2f\n", averageReading);
+        Serial.printf("Zero offset: %ld\n", zeroOffset);
+        Serial.printf("Known weight: %.3f\n", knownWeight);
+        Serial.printf("Calculated factor: -(%.2f - %ld) / %.3f = %.8f\n", 
+                     averageReading, zeroOffset, knownWeight, calibrationFactor);
+        
+        // Validate the calibration factor
+        if (calibrationFactor == 0.0f || isnan(calibrationFactor) || isinf(calibrationFactor)) {
+            Serial.println("❌ Invalid calibration factor calculated");
+            return false;
+        }
+        
+        // Set the calibration factor manually
+        myScale.setCalibrationFactor(calibrationFactor);
+        
+        // Verify calibration with multiple test readings
+        delay(1000);
+        Serial.println("Verifying calibration with test readings...");
+        
+        int32_t testTotal = 0;
+        int testValidReadings = 0;
+        
+        for (int i = 0; i < 10; i++) {
+            delay(100);
+            if (myScale.available()) {
+                int32_t testRaw = myScale.getReading();
+                testTotal += testRaw;
+                testValidReadings++;
+            }
+        }
+        
+        if (testValidReadings > 5) {
+            float averageTestRaw = (float)testTotal / testValidReadings;
+            // FLIPPED: Use negated calculation to match new direction
+            float testReading = -((averageTestRaw - zeroOffset) / calibrationFactor);
+            float error = abs(abs(testReading) - knownWeight);  // Compare absolute values
+            
+            Serial.printf("✓ Calibration factor: %.8f\n", calibrationFactor);
+            Serial.printf("Test readings: %.1f average raw, %.3f calculated weight\n", averageTestRaw, testReading);
+            Serial.printf("Expected: ±%.3f units\n", knownWeight);
+            Serial.printf("Error: %.3f units (%.1f%%)\n", error, (error/knownWeight)*100);
+            
+            // Determine direction based on the test reading
+            bool isCompression = (testReading < 0);
+            if (isCompression) {
+                Serial.println("✓ Calibrated for COMPRESSION (negative readings)");
+            } else {
+                Serial.println("✓ Calibrated for TENSION (positive readings)");
+            }
+            
+            if (error / knownWeight > 0.05) { // 5% error threshold
+                Serial.println("⚠️  Warning: High calibration error - check setup");
+            } else {
+                Serial.println("✓ Calibration successful!");
+            }
+            
+            saveCalibration();
+            Serial.println("=== CALIBRATION COMPLETE ===\n");
+            return true;
+        } else {
+            Serial.println("❌ Could not verify calibration - not enough test readings");
+            return false;
+        }
+    }
+    
+    float getWeight() {
+        if (!initialized) return 0.0f;
+        
+        // Simple, clean I2C read without interrupt interference
+        if (!myScale.available()) {
+            // Don't wait - just return last known value to avoid blocking
+            return 0.0f;
+        }
+        
+        // Do our own conversion instead of using library's getWeight()
+        int32_t rawReading = myScale.getReading();
+        
+        // Manual conversion: (rawReading - zeroOffset) / calibrationFactor
+        int32_t zeroOffset = myScale.getZeroOffset();
+        float calibrationFactor = myScale.getCalibrationFactor();
+        
+        // Check for completely invalid calibration (but allow negative values)
+        if (calibrationFactor == 0.0f || isnan(calibrationFactor)) {
+            handleError("Invalid calibration factor");
+            return 0.0f;
+        }
+        
+        // Calculate weight manually - handles both positive and negative properly
+        // FLIPPED: Negate the result to reverse tension/compression direction
+        float weight = -((float)(rawReading - zeroOffset) / calibrationFactor);
+        
+        // Sanity check (allow negative for compression)
+        if (abs(weight) > LoadCellConfig::MAX_REASONABLE_WEIGHT_KG) {
+            handleError("Unreasonable weight reading");
+            liveData.sensorSaturated = true;
+            return 0.0f;
+        }
+        
+        // Reset error counter on successful read
+        consecutiveErrors = 0;
+        liveData.scaleError = false;
+        
+        return weight;
+    }
+    
+    float getForceN() {
+        return getWeight() * 9.81f; // Convert kg to Newtons
+    }
+    
+    void tare() {
+        if (!initialized) return;
+        
+        Serial.println("Taring scale...");
+        
+        // Manual tare calculation (more reliable than library)
+        int32_t total = 0;
+        int validReadings = 0;
+        
+        for (int i = 0; i < LoadCellConfig::CALIBRATION_SAMPLES; i++) {
+            delay(50);
+            if (myScale.available()) {
+                int32_t reading = myScale.getReading();
+                total += reading;
+                validReadings++;
+            }
+        }
+        
+        if (validReadings > LoadCellConfig::CALIBRATION_SAMPLES / 2) {
+            int32_t newZeroOffset = total / validReadings;
+            myScale.setZeroOffset(newZeroOffset);
+            saveCalibration();
+            Serial.printf("✓ New zero offset: %ld (from %d readings)\n", newZeroOffset, validReadings);
+        } else {
+            Serial.println("❌ Tare failed - not enough valid readings");
+        }
+    }
+    
+    // New function for averaged tare at test start
+    bool performTestTare() {
+        if (!initialized) return false;
+        
+        Serial.println("Performing averaged tare for test...");
+        
+        int32_t total = 0;
+        int validReadings = 0;
+        
+        // Take 32 readings for faster tare
+        for (int i = 0; i < 32; i++) {
+            delay(25); // Faster sampling for test start
+            if (myScale.available()) {
+                int32_t reading = myScale.getReading();
+                total += reading;
+                validReadings++;
+            }
+        }
+        
+        if (validReadings > 16) { // Need at least half
+            int32_t newZeroOffset = total / validReadings;
+            myScale.setZeroOffset(newZeroOffset);
+            Serial.printf("✓ Test tare complete: %ld (from %d readings)\n", newZeroOffset, validReadings);
+            return true;
+        } else {
+            Serial.println("❌ Test tare failed - not enough readings");
+            return false;
+        }
+    }
+    
+    void runDiagnostics() {
+        Serial.println("\n=== LOAD CELL DIAGNOSTICS ===");
+        
+        if (!initialized) {
+            Serial.println("❌ Load cell not initialized");
+            return;
+        }
+        
+        // Test 1: Raw readings stability
+        Serial.println("Test 1: Raw readings (10 samples)");
+        int32_t readings[10];
+        bool allValid = true;
+        
+        for (int i = 0; i < 10; i++) {
+            uint32_t startTime = millis();
+            while (!myScale.available() && (millis() - startTime < 100)) {
+                delay(1);
+            }
+            
+            if (myScale.available()) {
+                readings[i] = myScale.getReading();
+                Serial.printf("  %d: %ld\n", i+1, readings[i]);
+            } else {
+                Serial.printf("  %d: TIMEOUT\n", i+1);
+                allValid = false;
+            }
+            delay(50);
+        }
+        
+        // Calculate stability
+        if (allValid) {
+            int32_t minVal = readings[0], maxVal = readings[0];
+            for (int i = 1; i < 10; i++) {
+                if (readings[i] < minVal) minVal = readings[i];
+                if (readings[i] > maxVal) maxVal = readings[i];
+            }
+            Serial.printf("  Range: %ld (lower is better)\n", maxVal - minVal);
+        }
+        
+        // Test 2: Calibrated readings
+        Serial.println("\nTest 2: Calibrated readings (5 samples)");
+        for (int i = 0; i < 5; i++) {
+            float weight = getWeight();
+            Serial.printf("  %d: %.3f kg (%.2f N)\n", i+1, weight, weight * 9.81f);
+            delay(200);
+        }
+        
+        // Test 3: Configuration status
+        Serial.println("\nTest 3: Configuration");
+        Serial.printf("  Calibration factor: %.8f\n", myScale.getCalibrationFactor());
+        Serial.printf("  Zero offset: %ld\n", myScale.getZeroOffset());
+        Serial.printf("  Gain: %dx (actual hardware setting)\n", getCurrentGain());
+        Serial.printf("  Sample rate: 80 SPS\n");
+        Serial.printf("  Consecutive errors: %lu\n", consecutiveErrors);
+        
+        Serial.println("=== DIAGNOSTICS COMPLETE ===\n");
+    }
+    
+private:
+    void handleError(const char* errorMsg) {
+        consecutiveErrors++;
+        liveData.scaleError = true;
+        
+        // Throttle error messages (every 5 seconds)
+        if (millis() - lastErrorTime > 5000) {
+            Serial.printf("⚠️  Load cell error: %s (count: %lu)\n", errorMsg, consecutiveErrors);
+            lastErrorTime = millis();
+        }
+        
+        // If too many consecutive errors, try to reinitialize
+        if (consecutiveErrors > 50) {
+            Serial.println("🔄 Too many errors - attempting reinitialization");
+            initialize();
+            consecutiveErrors = 0;
+        }
+    }
+    
+    void waitForUserInput() {
+        while (Serial.available()) Serial.read();
+        while (Serial.available() == 0) {
+            delay(10);
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        while (Serial.available()) Serial.read();
+    }
+};
+
+// Global load cell manager instance
+LoadCellManager loadCell;
+
+// ===== UTILITY FUNCTIONS =====
+uint8_t getCurrentGain() {
+    return currentGainSetting;
+}
+
+uint32_t getStepsTakenSafe() {
+    portENTER_CRITICAL(&timerMux);
+    uint32_t steps = stepsTaken;
+    portEXIT_CRITICAL(&timerMux);
+    return steps;
+}
+
+const char* getTestModeString(TestMode mode) {
+    switch (mode) {
+        case TEST_ULTIMATE: return "Ultimate";
+        case TEST_MODULUS: return "Modulus";
+        case TEST_FATIGUE: return "Fatigue";
+        case TEST_CREEP: return "Creep";
+        default: return "Unknown";
+    }
+}
+
+float getCurrentTestRate_mmps() {
+    return testRateOptions_mmpm[testRateIndex] / 60.0f; // Convert mm/min to mm/s
+}
+
+// ===== NEOKEYS FUNCTIONS =====
+void initializeNeoKeys() {
+    if (!neokey.begin(0x30)) {
+        Serial.println("❌ NeoKeys not detected - check wiring");
+        return;
+    }
+    
+    Serial.println("✓ NeoKeys 1x4 initialized");
+    
+    // Initial light pattern - show we're alive
+    for (int i = 0; i < 4; i++) {
+        neokey.pixels.setPixelColor(i, COLOR_WHITE);
+        neokey.pixels.show();
+        delay(100);
+    }
+    
+    // Clear all keys
+    for (int i = 0; i < 4; i++) {
+        neokey.pixels.setPixelColor(i, COLOR_OFF);
+    }
+    neokey.pixels.show();
+    
+    // Initialize button states
+    for (int i = 0; i < 4; i++) {
+        buttons[i] = {false, false, 0};
+    }
+}
+
+void updateNeoKeyLighting() {
+    static unsigned long lastUpdate = 0;
+    static SystemState lastState = STATE_MENU_MAIN;
+    static bool lastButtonStates[4] = {false, false, false, false};
+    
+    // Only update if state changed, button states changed, or every 100ms
+    bool needsUpdate = false;
+    unsigned long now = millis();
+    
+    if (currentState != lastState) {
+        needsUpdate = true;
+        lastState = currentState;
+    }
+    
+    for (int i = 0; i < 4; i++) {
+        if (buttons[i].current != lastButtonStates[i]) {
+            needsUpdate = true;
+            lastButtonStates[i] = buttons[i].current;
+        }
+    }
+    
+    if ((now - lastUpdate) > 100) {
+        needsUpdate = true;
+    }
+    
+    if (!needsUpdate) return;
+    
+    lastUpdate = now;
+    
+    // Batch all LED updates, then show() once at the end
+    switch (currentState) {
+        case STATE_MENU_MAIN:
+        case STATE_MENU_LOAD_CELL:
+            neokey.pixels.setPixelColor(BTN_NAV_LEFT, COLOR_WHITE);
+            neokey.pixels.setPixelColor(BTN_NAV_RIGHT, COLOR_WHITE);
+            neokey.pixels.setPixelColor(BTN_ENTER, COLOR_GREEN);
+            neokey.pixels.setPixelColor(BTN_EXIT, COLOR_RED);
+            break;
+            
+        case STATE_JOG:
+            if (buttons[BTN_NAV_LEFT].current) {
+                neokey.pixels.setPixelColor(BTN_NAV_LEFT, COLOR_ORANGE);
+                neokey.pixels.setPixelColor(BTN_NAV_RIGHT, COLOR_DIM_WHITE);
+            } else if (buttons[BTN_NAV_RIGHT].current) {
+                neokey.pixels.setPixelColor(BTN_NAV_LEFT, COLOR_DIM_WHITE);
+                neokey.pixels.setPixelColor(BTN_NAV_RIGHT, COLOR_ORANGE);
+            } else {
+                neokey.pixels.setPixelColor(BTN_NAV_LEFT, COLOR_WHITE);
+                neokey.pixels.setPixelColor(BTN_NAV_RIGHT, COLOR_WHITE);
+            }
+            neokey.pixels.setPixelColor(BTN_ENTER, COLOR_OFF);
+            neokey.pixels.setPixelColor(BTN_EXIT, COLOR_RED);
+            break;
+            
+        case STATE_TEST_CONFIRM:
+            neokey.pixels.setPixelColor(BTN_NAV_LEFT, COLOR_OFF);
+            neokey.pixels.setPixelColor(BTN_NAV_RIGHT, COLOR_OFF);
+            neokey.pixels.setPixelColor(BTN_ENTER, COLOR_GREEN);
+            neokey.pixels.setPixelColor(BTN_EXIT, COLOR_RED);
+            break;
+            
+        case STATE_TEST:
+            // All buttons red during test (E-STOP)
+            for (int i = 0; i < 4; i++) {
+                neokey.pixels.setPixelColor(i, COLOR_RED);
+            }
+            break;
+            
+        case STATE_ULTIMATE_RESULT:
+            // All buttons blue - any button exits to main menu
+            for (int i = 0; i < 4; i++) {
+                neokey.pixels.setPixelColor(i, COLOR_BLUE);
+            }
+            break;
+    }
+    
+    // Single I2C transaction to update all LEDs
+    neokey.pixels.show();
+}
+
+void readNeoKeys() {
+    uint8_t keyData = neokey.read();
+    unsigned long now = millis();
+    
+    // Ultra-responsive button handling with minimal debouncing
+    for (int i = 0; i < 4; i++) {
+        bool pressed = (keyData & (1 << i)) != 0;
+        
+        // If state changed, record the time
+        if (pressed != buttons[i].last) {
+            buttons[i].lastChangeTime = now;
+            buttons[i].last = pressed;
+        }
+        
+        // Minimal 1ms debounce to filter electrical noise only
+        if ((now - buttons[i].lastChangeTime) >= 1) {
+            if (pressed != buttons[i].current) {
+                buttons[i].current = pressed;
+                
+                // Trigger immediately on state change
+                if (pressed) {
+                    handleButtonPress(i);
+                } else {
+                    handleButtonRelease(i);
+                }
+            }
+        }
+    }
+}
+
+void handleButtonPress(uint8_t buttonIndex) {
+    Serial.printf("Button %d pressed\n", buttonIndex);
+    
+    // During test, all buttons act as E-STOP and go to results
+    if (currentState == STATE_TEST) {
+        stopTest(); // Uses same stopTest() function as algorithm
+        Serial.println("🚨 E-STOP: Test stopped by user");
+        return;
+    }
+    
+    // Handle button actions based on current state
+    switch (currentState) {
+        case STATE_MENU_MAIN:
+            handleMainMenuButton(buttonIndex);
+            break;
+        case STATE_MENU_LOAD_CELL:
+            handleLoadCellMenuButton(buttonIndex);
+            break;
+        case STATE_JOG:
+            handleJogButton(buttonIndex);
+            break;
+        case STATE_TEST_CONFIRM:
+            handleTestConfirmButton(buttonIndex);
+            break;
+        case STATE_ULTIMATE_RESULT:
+            // All buttons exit to main menu
+            currentState = STATE_MENU_MAIN;
+            Serial.println("Exiting results to main menu");
+            break;
+    }
+}
+
+void handleButtonRelease(uint8_t buttonIndex) {
+    // Handle button release events (mainly for jog mode)
+    if (currentState == STATE_JOG) {
+        if (buttonIndex == BTN_NAV_LEFT || buttonIndex == BTN_NAV_RIGHT) {
+            // Stop jogging when navigation button is released
+            moveStepper = false;
+            stopStepTimer();
+        }
+    }
+}
+
+void handleMainMenuButton(uint8_t buttonIndex) {
+    switch (buttonIndex) {
+        case BTN_NAV_LEFT:
+            menuIndex = (menuIndex + mainMenuItemCount - 1) % mainMenuItemCount;
+            break;
+        case BTN_NAV_RIGHT:
+            menuIndex = (menuIndex + 1) % mainMenuItemCount;
+            break;
+        case BTN_ENTER:
+            switch (menuIndex) {
+                case 0: 
+                    currentState = STATE_JOG; 
+                    jogStepCounter = 0; 
+                    break;
+                case 1: 
+                    jogRateIndex = (jogRateIndex + 1) % 3; 
+                    break;
+                case 2: 
+                    if (liveData.scaleCalibrated) {
+                        currentState = STATE_TEST_CONFIRM; // Go to confirmation screen first
+                    }
+                    break;
+                case 3: 
+                    testRateIndex = (testRateIndex + 1) % 2; // Toggle between 5mm/min and 1mm/min
+                    break;
+                case 4: 
+                    currentTestMode = (TestMode)((currentTestMode + 1) % 2); // Only Ultimate and Modulus
+                    break;
+                case 5:
+                    currentState = STATE_MENU_LOAD_CELL;
+                    menuIndex = 0;
+                    break;
+            }
+            break;
+        case BTN_EXIT:
+            // Exit/Back functionality could be added here
+            break;
+    }
+}
+
+void handleLoadCellMenuButton(uint8_t buttonIndex) {
+    switch (buttonIndex) {
+        case BTN_NAV_LEFT:
+            // Only one item, so no navigation needed
+            break;
+        case BTN_NAV_RIGHT:
+            // Only one item, so no navigation needed
+            break;
+        case BTN_ENTER:
+            // Only tare function
+            if (menuIndex == 0) {
+                xEventGroupSetBits(testEventFlags, EVT_TARE_REQUEST);
+            }
+            break;
+        case BTN_EXIT:
+            currentState = STATE_MENU_MAIN;
+            menuIndex = 0;
+            break;
+    }
+}
+
+void handleJogButton(uint8_t buttonIndex) {
+    switch (buttonIndex) {
+        case BTN_NAV_LEFT:
+            // FIXED: Jog toward fixed jaw (reverse direction)
+            stepperDir = false; // toward fixed jaw
+            moveStepper = true;
+            startJog(jogRateOptions[jogRateIndex]);
+            break;
+        case BTN_NAV_RIGHT:
+            // FIXED: Jog away from fixed jaw (forward direction - correct for tensile)
+            stepperDir = true; // away from fixed jaw  
+            moveStepper = true;
+            startJog(jogRateOptions[jogRateIndex]);
+            break;
+        case BTN_EXIT:
+            moveStepper = false;
+            stopStepTimer();
+            currentState = STATE_MENU_MAIN;
+            break;
+    }
+}
+
+void handleTestConfirmButton(uint8_t buttonIndex) {
+    switch (buttonIndex) {
+        case BTN_ENTER:
+            // Start the test
+            currentState = STATE_TEST;
+            startTest();
+            break;
+        case BTN_EXIT:
+            // Go back to main menu
+            currentState = STATE_MENU_MAIN;
+            break;
+    }
+}
+
+// ===== DATA ACQUISITION =====
+void recordDataPoint() {
+    if (!liveData.testActive) return;
+    
+    // Check buffer limits based on test mode
+    if (currentTestMode == TEST_MODULUS && totalDataPoints >= MAX_TEST_DURATION_POINTS_MODULUS) {
+        liveData.bufferOverflow = true;
+        stopTest();
+        Serial.println("⚠️  Modulus test auto-stopped: Maximum data points reached");
+        return;
+    }
+    
+    TestDataPoint& point = dataBuffer[bufferWriteIndex];
+    point.timestamp_us = esp_timer_get_time() - liveData.testStartTime_us;
+    point.force_N = liveData.currentForce_N;
+    point.position_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm; // Relative to test start
+    point.step_count = getStepsTakenSafe();
+    point.valid = true;
+    
+    // Rolling buffer logic for Ultimate mode
+    if (currentTestMode == TEST_ULTIMATE) {
+        bufferWriteIndex = (bufferWriteIndex + 1) % ROLLING_BUFFER_SIZE;
+        if (bufferWriteIndex == 0 && totalDataPoints >= ROLLING_BUFFER_SIZE) {
+            bufferWrapped = true;
+        }
+    } else {
+        // Full buffer for Modulus mode
+        bufferWriteIndex = (bufferWriteIndex + 1) % BUFFER_SIZE;
+        if (bufferWriteIndex == 0) bufferWrapped = true;
+    }
+    
+    totalDataPoints++;
+    
+    xEventGroupSetBits(testEventFlags, EVT_DATA_READY);
+}
+
+void printBufferToSerial() {
+    Serial.println("=== TEST DATA EXPORT ===");
+    Serial.printf("Test mode: %s\n", getTestModeString(currentTestMode));
+    Serial.println("Timestamp_us,Force_N,Position_mm,Step_Count");
+    
+    uint16_t bufferSize = (currentTestMode == TEST_ULTIMATE) ? ROLLING_BUFFER_SIZE : BUFFER_SIZE;
+    uint16_t startIndex = bufferWrapped ? bufferWriteIndex : 0;
+    uint16_t count = bufferWrapped ? bufferSize : bufferWriteIndex;
+    
+    if (currentTestMode == TEST_ULTIMATE) {
+        Serial.printf("# Rolling buffer: showing last %d points of %lu total\n", count, totalDataPoints);
+    } else {
+        Serial.printf("# Full buffer: showing all %d points\n", count);
+    }
+    
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t index = (startIndex + i) % bufferSize;
+        TestDataPoint& point = dataBuffer[index];
+        
+        if (point.valid) {
+            Serial.printf("%llu,%.3f,%.3f,%lu\n", 
+                point.timestamp_us, point.force_N, 
+                point.position_mm, point.step_count);
+        }
+    }
+    Serial.println("=== END DATA ===");
+}
+
+// ===== HARDWARE TIMER INTERRUPT =====
+void IRAM_ATTR stepTimerCallback() {
+    portENTER_CRITICAL_ISR(&timerMux);
+    if (moveStepper && motorEnabled) {
+        stepState = !stepState;
+        if (stepState)
+            REG_WRITE(GPIO_OUT_W1TS_REG, (1 << STEP));
+        else
+            REG_WRITE(GPIO_OUT_W1TC_REG, (1 << STEP));
+
+        if (stepState) {
+            stepsTaken++;
+            jogStepCounter += (stepperDir ? 1 : -1);
+            
+            if (stepsTaken >= MOTOR_STEPS_PER_REV) {
+                stepsTaken = 0;
+                totalRotations++;
+                if (totalRotations > 30000) totalRotations = 0;
+            }
+        }
+    }
+    portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+// ===== TIMER FUNCTIONS =====
+void startStepTimer(uint32_t sps) {
+    if (sps == 0) {
+        stopStepTimer();
+        return;
+    }
+    
+    if (stepTimer) {
+        timerEnd(stepTimer);
+        stepTimer = NULL;
+        delay(10);
+    }
+    
+    if (sps < 10) sps = 10;
+    if (sps > 10000) sps = 10000;
+    
+    stepTimer = timerBegin(1000000);
+    if (!stepTimer) return;
+    
+    uint64_t alarmValue = 500000 / sps;
+    if (alarmValue < 50) alarmValue = 50;
+    
+    timerAttachInterrupt(stepTimer, &stepTimerCallback);
+    timerAlarm(stepTimer, alarmValue, true, 0);
+    timerRunning = true;
+}
+
+void stopStepTimer() {
+    if (stepTimer) {
+        timerEnd(stepTimer);
+        stepTimer = NULL;
+    }
+    REG_WRITE(GPIO_OUT_W1TC_REG, (1 << STEP));
+    stepState = false;
+    timerRunning = false;
+}
+
+// ===== MOTION CONTROL =====
+void startJog(float rate_mmps) {
+    uint32_t sps = rate_mmps / MM_PER_STEP;
+    if (sps < 10) sps = 10;
+    if (sps > 10000) sps = 10000;
+    
+    stepperSpeed = sps;
+    digitalWrite(DIR, stepperDir);
+    startStepTimer(sps);
+}
+
+void startTest() {
+    Serial.println("Starting test preparation...");
+    
+    // Perform averaged tare first
+    if (!loadCell.performTestTare()) {
+        Serial.println("❌ Test tare failed - aborting test");
+        currentState = STATE_MENU_MAIN;
+        return;
+    }
+    
+    // Reset position tracking
+    liveData.testStartPosition_mm = jogStepCounter * MM_PER_STEP;
+    liveData.positionReset = true;
+    
+    Serial.printf("🎯 Test start position: %.3fmm (step counter: %ld)\n", 
+                  liveData.testStartPosition_mm, jogStepCounter);
+    
+    // Initialize test data - ensure clean slate
+    liveData.testActive = true;
+    liveData.testStartTime_us = esp_timer_get_time();
+    liveData.testEndTime_us = 0;
+    liveData.peakForce_N = 0.0f;
+    liveData.peakForcePosition_mm = 0.0f;  // Reset position
+    liveData.peakForceTime_us = 0;         // Reset time
+    liveData.forceDropCounter = 0;
+    liveData.bufferOverflow = false;
+    liveData.sensorSaturated = false;
+    bufferWriteIndex = 0;
+    bufferWrapped = false;
+    totalDataPoints = 0;
+    
+    // FIXED: For tensile tests, move away from fixed jaw
+    stepperDir = true; // away from fixed jaw (correct for tensile testing)
+    moveStepper = true;
+    float testRate_mmps = getCurrentTestRate_mmps();
+    startJog(testRate_mmps);
+    
+    xEventGroupSetBits(testEventFlags, EVT_TEST_START);
+    Serial.printf("🚀 Test started: %s mode at %.1f mm/min (%.3f mm/s)\n", 
+                  getTestModeString(currentTestMode), testRateOptions_mmpm[testRateIndex], testRate_mmps);
+}
+
+void stopTest() {
+    // Store end time immediately when test stops
+    liveData.testEndTime_us = esp_timer_get_time();
+    liveData.testActive = false;
+    moveStepper = false;
+    stopStepTimer();
+    
+    float testDuration_s = (float)(liveData.testEndTime_us - liveData.testStartTime_us) / 1000000.0f;
+    float finalPosition_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+    
+    // Debug: Show complete test data
+    Serial.printf("🏁 TEST STOPPED - Duration: %.1fs, Data points: %lu\n", testDuration_s, totalDataPoints);
+    Serial.printf("   Start pos: %.3fmm, Final pos: %.3fmm, Travel: %.3fmm\n", 
+                  liveData.testStartPosition_mm, liveData.currentPosition_mm, finalPosition_mm);
+    Serial.printf("   Peak data: Force=%.2fN, Position=%.3fmm", liveData.peakForce_N, liveData.peakForcePosition_mm);
+    
+    if (liveData.peakForceTime_us > 0) {
+        float timeToPeak_s = (float)(liveData.peakForceTime_us - liveData.testStartTime_us) / 1000000.0f;
+        Serial.printf(", Time=%.1fs\n", timeToPeak_s);
+    } else {
+        Serial.println(", Time=NONE");
+    }
+    
+    xEventGroupSetBits(testEventFlags, EVT_TEST_STOP);
+    
+    // Always go to results screen for Ultimate tests (both algorithm and E-stop)
+    if (currentTestMode == TEST_ULTIMATE) {
+        currentState = STATE_ULTIMATE_RESULT;
+    } else {
+        currentState = STATE_MENU_MAIN;
+    }
+}
+
+// ===== MENU FUNCTIONS =====
+const char* getMainMenuLabel(uint8_t index) {
+    static char buffer[30];
+    switch (index) {
+        case 0: return "jog mode";
+        case 1: snprintf(buffer, sizeof(buffer), "jogR [%.1f mm/s]", jogRateOptions[jogRateIndex]); return buffer;
+        case 2: return "test mode";
+        case 3: snprintf(buffer, sizeof(buffer), "testR [%.0f mm/m]", testRateOptions_mmpm[testRateIndex]); return buffer;
+        case 4: snprintf(buffer, sizeof(buffer), "testT [%s]", getTestModeString(currentTestMode)); return buffer;
+        case 5: return "load cell";
+        default: return "";
+    }
+}
+
+const char* getLoadCellMenuLabel(uint8_t index) {
+    switch (index) {
+        case 0: return "tare";
+        default: return "";
+    }
+}
+
+// ===== TASKS =====
+void neokeyTask(void* pvParameters) {
+    Serial.println("🎮 NeoKey task started on Core 0 (high priority)");
+    for (;;) {
+        readNeoKeys();
+        updateNeoKeyLighting();
+        vTaskDelay(pdMS_TO_TICKS(1)); // ~1000Hz polling rate - ultra responsive
+    }
+}
+
+void dataAcquisitionTask(void* pvParameters) {
+    Serial.println("📊 Data acquisition task started on Core 1");
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(12); // ~80Hz
+    
+    for (;;) {
+        // Update position (with 3 decimal precision)
+        liveData.currentPosition_mm = jogStepCounter * MM_PER_STEP;
+        liveData.totalSteps = getStepsTakenSafe();
+        
+        // Record data during testing (using force value set by main loop)
+        if (liveData.testActive) {
+            recordDataPoint();
+            
+            // Simple Ultimate test break detection - track peak always, check break when peak exists
+            if (currentTestMode == TEST_ULTIMATE) {
+                
+                // Debug: Show force readings every 2 seconds
+                static uint32_t debugCounter = 0;
+                debugCounter++;
+                if (debugCounter % 160 == 0) { // Every 2 seconds at 80Hz
+                    float currentPos = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+                    Serial.printf("🔍 Test: Force=%.1fN, Pos=%.3fmm, Peak=%.1fN@%.3fmm\n", 
+                                 liveData.currentForce_N, currentPos, liveData.peakForce_N, liveData.peakForcePosition_mm);
+                }
+                
+                // Always track peak force and position when force > 10N
+                if (abs(liveData.currentForce_N) > 10.0f) {
+                    // Check if this is a new peak
+                    if (abs(liveData.currentForce_N) > abs(liveData.peakForce_N)) {
+                        liveData.peakForce_N = liveData.currentForce_N;
+                        liveData.peakForcePosition_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+                        liveData.peakForceTime_us = esp_timer_get_time();
+                        liveData.forceDropCounter = 0; // Reset drop counter on new peak
+                        
+                        float timeToPeak_s = (float)(liveData.peakForceTime_us - liveData.testStartTime_us) / 1000000.0f;
+                        Serial.printf("📈 NEW PEAK: %.1fN at %.3fmm (%.1fs from start)\n", 
+                                     liveData.peakForce_N, 
+                                     liveData.peakForcePosition_mm,
+                                     timeToPeak_s);
+                    }
+                }
+                
+                // Check for break if we have a meaningful peak (even when current force is low)
+                if (abs(liveData.peakForce_N) > 20.0f) {
+                    float fiftyPercentThreshold = abs(liveData.peakForce_N) * 0.5f;
+                    
+                    if (abs(liveData.currentForce_N) < fiftyPercentThreshold) {
+                        liveData.forceDropCounter++;
+                        // Debug every second
+                        if (liveData.forceDropCounter % 80 == 0) {
+                            Serial.printf("⏳ Drop counter: %d/400 (%.1fs/5s) - Current: %.1fN < Threshold: %.1fN\n", 
+                                        liveData.forceDropCounter, liveData.forceDropCounter / 80.0f,
+                                        abs(liveData.currentForce_N), fiftyPercentThreshold);
+                        }
+                        if (liveData.forceDropCounter >= 400) { // 5 seconds at 80Hz
+                            stopTest();
+                            Serial.printf("🏆 Ultimate failure: Force stayed below 50%% of peak %.1fN for 5s\n", 
+                                        liveData.peakForce_N);
+                        }
+                    } else {
+                        if (liveData.forceDropCounter > 0) {
+                            Serial.printf("🔄 Force recovered: %.1fN > %.1fN - Reset counter\n", 
+                                        abs(liveData.currentForce_N), fiftyPercentThreshold);
+                        }
+                        liveData.forceDropCounter = 0; // Reset counter if force recovers
+                    }
+                }
+            }
+        }
+        
+        // Handle tare requests
+        EventBits_t bits = xEventGroupGetBits(testEventFlags);
+        if (bits & EVT_TARE_REQUEST) {
+            // Tare request will be handled by main loop
+            xEventGroupClearBits(testEventFlags, EVT_TARE_REQUEST);
+        }
+        
+        vTaskDelayUntil(&lastWakeTime, frequency);
+    }
+}
+
+void uiTask(void* pvParameters) {
+    Serial.println("🖥️  UI task started on Core 1");
+    for (;;) {
+        // Only handle display updates - buttons handled in separate task
+        jogDistanceMM = jogStepCounter * MM_PER_STEP;
+        updateDisplay();
+        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz display refresh - reduces I2C congestion
+    }
+}
+
+// ===== DISPLAY FUNCTIONS =====
+void updateDisplay() {
+    display.clearDisplay();
+    
+    switch (currentState) {
+        case STATE_MENU_MAIN:
+            drawMainMenu();
+            break;
+        case STATE_MENU_LOAD_CELL:
+            drawLoadCellMenu();
+            break;
+        case STATE_JOG:
+            drawJogScreen();
+            break;
+        case STATE_TEST_CONFIRM:
+            drawTestConfirmScreen();
+            break;
+        case STATE_TEST:
+            drawTestScreen();
+            break;
+        case STATE_ULTIMATE_RESULT:
+            drawResultScreen();
+            break;
+    }
+    display.display();
+}
+
+void drawMainMenu() {
+    // Use 128x128 space efficiently
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header with full width
+    display.fillRect(0, 0, 128, 12, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(45, 2);
+    display.println("UTM_REV3");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Menu items with better spacing for 128x128
+    display.setCursor(4, 18);
+    
+    for (uint8_t i = 0; i < mainMenuItemCount; i++) {
+        if (i == menuIndex) {
+            // Highlight selected item
+            display.fillRect(0, display.getCursorY() - 1, 128, 10, SSD1327_WHITE);
+            display.setTextColor(SSD1327_BLACK);
+            display.setCursor(4, display.getCursorY());
+            display.print("> ");
+            display.print(getMainMenuLabel(i));
+            display.setTextColor(SSD1327_WHITE);
+        } else {
+            display.print("  ");
+            display.print(getMainMenuLabel(i));
+        }
+        display.setCursor(4, display.getCursorY() + 12);
+    }
+    
+    // Status bar at bottom - simplified and smaller text
+    display.drawLine(0, 112, 128, 112, SSD1327_WHITE);
+    display.setCursor(4, 116);
+    display.setTextSize(1);
+    if (liveData.scaleCalibrated) {
+        display.print("CALIBRATED");
+    } else {
+        display.print("NEEDS CAL");
+    }
+    
+    // Show force if calibrated  
+    if (liveData.scaleCalibrated) {
+        display.setCursor(80, 116);
+        display.printf("%.1fN", liveData.currentForce_N);
+    }
+}
+
+void drawLoadCellMenu() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header
+    display.fillRect(0, 0, 128, 12, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(42, 2);
+    display.println("LOAD CELL");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Status - simplified
+    display.setCursor(4, 18);
+    if (liveData.scaleCalibrated) {
+        display.print("CALIBRATED");
+    } else {
+        display.print("NOT CALIBRATED");
+    }
+    if (liveData.scaleError) display.print(" (ERR)");
+    
+    // Large live readings - sexy like jog menu
+    if (liveData.scaleCalibrated) {
+        // Large force reading in Newtons
+        display.setTextSize(2);
+        display.setCursor(4, 35);
+        if (liveData.currentForce_N >= 0) {
+            display.print("+");
+        }
+        display.printf("%.1f N", liveData.currentForce_N);
+        
+        // Weight in kg on same line, smaller
+        display.setTextSize(1);
+        display.setCursor(4, 55);
+        display.printf("Weight: %.3f kg", liveData.currentForce_N / 9.81f);
+    } else {
+        display.setTextSize(2);
+        display.setCursor(4, 35);
+        display.print("NOT READY");
+        
+        display.setTextSize(1);
+        display.setCursor(4, 55);
+        display.print("Calibration required");
+    }
+    
+    // Calibration info (view-only, not scrollable)
+    if (liveData.scaleCalibrated) {
+        display.setTextSize(1);
+        display.setCursor(4, 70);
+        display.printf("Cal: %.2f", myScale.getCalibrationFactor());
+        
+        display.setCursor(4, 82);
+        display.printf("Offset: %ld", myScale.getZeroOffset());
+        
+        display.setCursor(4, 94);
+        // Read actual gain setting instead of assuming 16x
+        uint8_t currentGain = getCurrentGain();
+        display.printf("Gain: %dx", currentGain);
+    }
+    
+    // Single menu item at bottom
+    display.setCursor(4, 110);
+    if (menuIndex == 0) {
+        display.fillRect(0, 108, 128, 10, SSD1327_WHITE);
+        display.setTextColor(SSD1327_BLACK);
+        display.setCursor(4, 110);
+        display.print("> ");
+        display.print(getLoadCellMenuLabel(0));
+        display.setTextColor(SSD1327_WHITE);
+    } else {
+        display.print("  ");
+        display.print(getLoadCellMenuLabel(0));
+    }
+}
+
+void drawJogScreen() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header
+    display.fillRect(0, 0, 128, 12, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(45, 2);
+    display.println("JOG MODE");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Large position display with 3 decimals
+    display.setTextSize(2);
+    display.setCursor(10, 20);
+    display.printf("%.3f mm", jogDistanceMM);
+    
+    // Settings
+    display.setTextSize(1);
+    display.setCursor(4, 45);
+    display.printf("Rate: %.1f mm/s", jogRateOptions[jogRateIndex]);
+    
+    // Force reading
+    display.setCursor(4, 57);
+    if (liveData.scaleCalibrated) {
+        display.printf("Force: %.2f N", liveData.currentForce_N);
+    } else {
+        display.print("Force: Not Ready");
+    }
+    
+    // Clean direction indicators
+    display.setTextSize(1);
+    display.setCursor(4, 75);
+    if (buttons[BTN_NAV_LEFT].current) {
+        display.fillRect(0, 73, 60, 12, SSD1327_WHITE);
+        display.setTextColor(SSD1327_BLACK);
+        display.setCursor(4, 75);
+        display.print("← TOWARD");
+        display.setTextColor(SSD1327_WHITE);
+    } else {
+        display.print("← TOWARD");
+    }
+    
+    display.setCursor(78, 75);
+    if (buttons[BTN_NAV_RIGHT].current) {
+        display.fillRect(76, 73, 52, 12, SSD1327_WHITE);
+        display.setTextColor(SSD1327_BLACK);
+        display.setCursor(78, 75);
+        display.print("AWAY →");
+        display.setTextColor(SSD1327_WHITE);
+    } else {
+        display.print("AWAY →");
+    }
+}
+
+void drawTestConfirmScreen() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header
+    display.fillRect(0, 0, 128, 14, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(30, 3);
+    display.println("TEST CONFIRM");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Test settings
+    display.setCursor(4, 20);
+    display.printf("Type: %s", getTestModeString(currentTestMode));
+    
+    display.setCursor(4, 32);
+    display.printf("Rate: %.0f mm/min", testRateOptions_mmpm[testRateIndex]);
+    
+    display.setCursor(4, 44);
+    display.printf("     (%.3f mm/s)", getCurrentTestRate_mmps());
+    
+    // Current status
+    display.setCursor(4, 60);
+    display.printf("Position: %.3f mm", jogDistanceMM);
+    
+    display.setCursor(4, 72);
+    if (liveData.scaleCalibrated) {
+        display.printf("Force: %.2f N", liveData.currentForce_N);
+    } else {
+        display.print("Force: NOT READY");
+        
+        // Warning if not calibrated
+        display.setCursor(4, 100);
+        display.print("WARNING: Not calibrated!");
+    }
+}
+
+void drawTestScreen() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header
+    display.fillRect(0, 0, 128, 12, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(40, 2);
+    display.println("TEST ACTIVE");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Test info
+    display.setCursor(4, 18);
+    display.printf("Type: %s", getTestModeString(currentTestMode));
+    display.setCursor(4, 30);
+    display.printf("Rate: %.0f mm/min", testRateOptions_mmpm[testRateIndex]);
+    
+    // Large force display
+    display.setTextSize(2);
+    display.setCursor(4, 45);
+    if (liveData.currentForce_N >= 0) {
+        display.print("+");
+    }
+    display.printf("%.1f N", liveData.currentForce_N);
+    
+    // Peak force
+    display.setTextSize(1);
+    display.setCursor(4, 65);
+    display.printf("Peak: ");
+    if (liveData.peakForce_N >= 0) {
+        display.print("+");
+    }
+    display.printf("%.1f N", liveData.peakForce_N);
+    
+    // Position (relative to test start, 3 decimals)
+    display.setCursor(4, 77);
+    float relativePosition = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+    display.printf("Pos: %.3f mm", relativePosition);
+    
+    display.setCursor(4, 89);
+    display.printf("Data: %lu pts", totalDataPoints);
+    
+    // Test duration
+    if (liveData.testActive) {
+        float testTime_s = (float)(esp_timer_get_time() - liveData.testStartTime_us) / 1000000.0f;
+        display.setCursor(4, 101);
+        display.printf("Time: %.1fs", testTime_s);
+    }
+    
+    // Warnings only
+    if (liveData.bufferOverflow || liveData.sensorSaturated || liveData.scaleError) {
+        display.setCursor(4, 113);
+        if (liveData.bufferOverflow) display.print("BUF");
+        if (liveData.sensorSaturated) display.print(" SAT");
+        if (liveData.scaleError) display.print(" ERR");
+    }
+}
+
+void drawResultScreen() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Header - consistent title
+    display.fillRect(0, 0, 128, 14, SSD1327_WHITE);
+    display.setTextColor(SSD1327_BLACK);
+    display.setCursor(25, 3);  // Centered for "TEST RESULTS"
+    display.println("TEST RESULTS");
+    display.setTextColor(SSD1327_WHITE);
+    
+    // Peak force display
+    display.setTextSize(1);
+    display.setCursor(4, 20);
+    display.print("Peak: ");
+    if (liveData.peakForce_N >= 0) {
+        display.print("+");
+    }
+    display.printf("%.1f N", abs(liveData.peakForce_N));
+    
+    // Distance - always show if we have peak data
+    display.setCursor(4, 32);
+    display.printf("Distance: %.3f mm", liveData.peakForcePosition_mm);
+    
+    // Duration - always show if we have peak timing
+    if (liveData.peakForceTime_us > 0) {
+        float timeToPeak_s = (float)(liveData.peakForceTime_us - liveData.testStartTime_us) / 1000000.0f;
+        display.setCursor(4, 44);
+        display.printf("Duration: %.1fs", timeToPeak_s);
+    } else {
+        display.setCursor(4, 44);
+        display.print("Duration: --");
+    }
+    
+    // Data points
+    display.setCursor(4, 56);
+    display.printf("Data Points: %lu", totalDataPoints);
+    
+    if (liveData.sensorSaturated) {
+        display.setCursor(4, 68);
+        display.print("! CLIPPED DATA !");
+    }
+}
+
+// ===== SERIAL COMMAND HANDLING =====
+void handleSerialCommand(String command) {
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "help") {
+        printHelp();
+    }
+    else if (command == "status") {
+        printStatus();
+    }
+    else if (command == "calibrate") {
+        if (loadCell.performCalibration()) {
+            liveData.scaleCalibrated = true;
+        }
+    }
+    else if (command == "tare") {
+        loadCell.tare();
+    }
+    else if (command == "diag") {
+        loadCell.runDiagnostics();
+    }
+    else if (command == "reinit") {
+        Serial.println("🔄 Reinitializing load cell...");
+        if (loadCell.initialize()) {
+            liveData.scaleCalibrated = loadCell.loadCalibration();
+        }
+    }
+    else if (command == "export") {
+        printBufferToSerial();
+    }
+    else if (command == "exportcal") {
+        exportCalibrationValues();
+    }
+    else if (command == "test5") {
+        Serial.println("5 consecutive readings:");
+        for (int i = 0; i < 5; i++) {
+            float force = loadCell.getForceN();
+            Serial.printf("%d: %.3f N\n", i+1, force);
+            delay(200);
+        }
+    }
+    else if (command.startsWith("setcal ")) {
+        handleSetCalCommand(command);
+    }
+    else if (command.startsWith("gain ")) {
+        int gain = command.substring(5).toInt();
+        testDifferentGain(gain);
+    }
+    else if (command.startsWith("setgain ")) {
+        int gain = command.substring(8).toInt();
+        setGainPermanently(gain);
+    }
+    else if (command.startsWith("measure ")) {
+        int samples = command.substring(8).toInt();
+        if (samples <= 0) samples = 100;
+        runMeasurementTest(samples);
+    }
+    else if (command == "measure") {
+        runMeasurementTest(100); // Default 100 samples
+    }
+    else if (command == "slowdiag") {
+        runSlowDiagnostics();
+    }
+    else if (command == "i2cscan") {
+        scanI2CDevices();
+    }
+    else if (command == "clocktest") {
+        testI2CClockSpeeds();
+    }
+    else if (command == "hardwarereset") {
+        performHardwareReset();
+    }
+    else if (command == "powercycle") {
+        performPowerCycle();
+    }
+    else if (command == "tensiontest") {
+        testTensionCompression();
+    }
+    else if (command == "reset") {
+        Serial.println("🔄 Restarting system...");
+        delay(100);
+        esp_restart();
+    }
+    else {
+        Serial.printf("Unknown command: '%s'. Type 'help' for available commands.\n", command.c_str());
+    }
+}
+
+void printHelp() {
+    Serial.println("\n=== TENSILE MACHINE COMMANDS ===");
+    Serial.println();
+    Serial.println("CALIBRATION:");
+    Serial.println("  calibrate - Interactive calibration wizard (SERIAL ONLY)");
+    Serial.println("  setcal <factor> <offset> [gain] - Set values directly");
+    Serial.println("  exportcal - Export current calibration values");
+    Serial.println("  tare - Zero the scale");
+    Serial.println("  NOTE: Gain settings persist across reboots");
+    Serial.println();
+    Serial.println("BASIC DIAGNOSTICS:");
+    Serial.println("  status - Show system status");
+    Serial.println("  diag - Run standard load cell diagnostics");
+    Serial.println("  test5 - Show 5 consecutive readings");
+    Serial.println("  measure [samples] - Detailed accuracy analysis (default: 100)");
+    Serial.println("  tensiontest - Test both tension and compression");
+    Serial.println("  reinit - Reinitialize load cell");
+    Serial.println();
+    Serial.println("ADVANCED DIAGNOSTICS:");
+    Serial.println("  slowdiag - 30 slow readings with timing analysis");
+    Serial.println("  i2cscan - Scan for I2C devices");
+    Serial.println("  clocktest - Test different I2C clock speeds");
+    Serial.println("  hardwarereset - Reset NAU7802 chip");
+    Serial.println("  powercycle - Test power down/up cycle");
+    Serial.println("  gain <1-128> - Test specific gain setting (temporary)");
+    Serial.println("  setgain <1-128> - Set gain permanently");
+    Serial.println();
+    Serial.println("DATA:");
+    Serial.println("  export - Export test data as CSV");
+    Serial.println();
+    Serial.println("SYSTEM:");
+    Serial.println("  reset - Restart ESP32");
+    Serial.println("  help - Show this help");
+    Serial.println();
+    Serial.println("TROUBLESHOOTING WORKFLOW:");
+    Serial.println("  1. i2cscan     - Check I2C communication");
+    Serial.println("  2. slowdiag    - Check reading stability");
+    Serial.println("  3. measure 200 - Detailed accuracy analysis");
+    Serial.println("  4. tensiontest - Test both tension/compression");
+    Serial.println("  5. clocktest   - Test I2C speeds");
+    Serial.println("  6. gain 1      - Test lowest gain");
+    Serial.println("  7. hardwarereset - If all else fails");
+    Serial.println();
+    Serial.println("EXAMPLES:");
+    Serial.println("  setcal 2184.29321289 23198 16");
+    Serial.println("  gain 1 (test with 1x gain temporarily)");
+    Serial.println("  setgain 1 (set 1x gain permanently)");
+    Serial.println("  measure 500 (detailed analysis with 500 samples)");
+    Serial.println("  exportcal (show current calibration values)");
+    Serial.println("================================\n");
+}
+
+void printStatus() {
+    Serial.println("\n=== SYSTEM STATUS ===");
+    Serial.printf("Scale: %s\n", liveData.scaleCalibrated ? "✓ Calibrated" : "❌ Not calibrated");
+    Serial.printf("Test active: %s\n", liveData.testActive ? "✓ Yes" : "No");
+    Serial.printf("Current force: %+.2f N\n", liveData.currentForce_N);
+    Serial.printf("Current position: %.3f mm\n", liveData.currentPosition_mm);
+    
+    if (liveData.testActive) {
+        Serial.printf("Test mode: %s\n", getTestModeString(currentTestMode));
+        if (currentTestMode == TEST_ULTIMATE) {
+            Serial.printf("Data points: %lu (rolling buffer)\n", totalDataPoints);
+            Serial.printf("Peak force: %+.2f N at %.3f mm\n", liveData.peakForce_N, liveData.peakForcePosition_mm);
+        } else {
+            Serial.printf("Data points: %lu / %d max\n", totalDataPoints, MAX_TEST_DURATION_POINTS_MODULUS);
+            // Calculate remaining test time for Modulus
+            float remainingPoints = MAX_TEST_DURATION_POINTS_MODULUS - totalDataPoints;
+            float remainingTime_s = remainingPoints / 80.0f; // 80Hz data rate
+            Serial.printf("Estimated time remaining: %.1f minutes\n", remainingTime_s / 60.0f);
+        }
+    } else {
+        Serial.printf("Data points: %lu\n", totalDataPoints);
+    }
+    
+    Serial.printf("Buffer overflow: %s\n", liveData.bufferOverflow ? "⚠️  Yes" : "No");
+    Serial.printf("Sensor saturated: %s\n", liveData.sensorSaturated ? "⚠️  Yes" : "No");
+    Serial.printf("Scale error: %s\n", liveData.scaleError ? "⚠️  Yes" : "No");
+    
+    if (liveData.scaleCalibrated) {
+        Serial.printf("Cal Factor: %.8f\n", myScale.getCalibrationFactor());
+        Serial.printf("Zero Offset: %ld\n", myScale.getZeroOffset());
+        Serial.printf("Gain: %dx\n", getCurrentGain());
+    }
+    
+    // Memory info
+    Serial.printf("Free heap: %lu bytes\n", esp_get_free_heap_size());
+    Serial.printf("Ultimate buffer: %lu KB\n", (ROLLING_BUFFER_SIZE * sizeof(TestDataPoint)) / 1024);
+    Serial.printf("Modulus buffer: %lu KB\n", (BUFFER_SIZE * sizeof(TestDataPoint)) / 1024);
+    Serial.println("=====================\n");
+}
+
+// ===== CALIBRATION AND DIAGNOSTIC FUNCTIONS =====
+void exportCalibrationValues() {
+    Serial.println("\n=== CALIBRATION VALUES EXPORT ===");
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("❌ Scale not calibrated - no values to export");
+        return;
+    }
+    
+    float calibrationFactor = myScale.getCalibrationFactor();
+    int32_t zeroOffset = myScale.getZeroOffset();
+    
+    // Check for suspicious calibration values
+    if (calibrationFactor == 1.0f) {
+        Serial.println("⚠️  Warning: Calibration factor is 1.0 (default/uncalibrated)");
+    }
+    if (calibrationFactor == 0.0f || isnan(calibrationFactor)) {
+        Serial.println("❌ Invalid calibration factor detected!");
+    }
+    
+    Serial.println("Current calibration values:");
+    Serial.printf("Calibration Factor: %.8f\n", calibrationFactor);
+    Serial.printf("Zero Offset: %ld\n", zeroOffset);
+    Serial.printf("Gain: %dx (actual hardware setting)\n", getCurrentGain());
+    
+    // Show sample calculation
+    Serial.println("\nSample calculation test:");
+    if (myScale.available()) {
+        int32_t testRaw = myScale.getReading();
+        // Use flipped calculation to match current implementation
+        float testWeight = -((float)(testRaw - zeroOffset) / calibrationFactor);
+        Serial.printf("Raw: %ld, Calculated weight: %.6f kg (%.3f N)\n", 
+                     testRaw, testWeight, testWeight * 9.81f);
+    }
+    
+    Serial.println();
+    Serial.println("To restore these values later, use:");
+    Serial.printf("setcal %.8f %ld %d\n", calibrationFactor, zeroOffset, getCurrentGain());
+    Serial.println();
+    Serial.println("Or copy these values to your documentation:");
+    Serial.printf("Factor: %.8f\n", calibrationFactor);
+    Serial.printf("Offset: %ld\n", zeroOffset);
+    Serial.printf("Gain: %dx\n", getCurrentGain());
+    Serial.println("=== EXPORT COMPLETE ===\n");
+}
+
+void handleSetCalCommand(String command) {
+    String params = command.substring(7);
+    params.trim();
+    
+    int firstSpace = params.indexOf(' ');
+    int secondSpace = params.indexOf(' ', firstSpace + 1);
+    
+    if (firstSpace > 0) {
+        float factor = params.substring(0, firstSpace).toFloat();
+        int32_t offset;
+        int gain = 16;
+        
+        if (secondSpace > 0) {
+            offset = params.substring(firstSpace + 1, secondSpace).toInt();
+            gain = params.substring(secondSpace + 1).toInt();
+        } else {
+            offset = params.substring(firstSpace + 1).toInt();
+        }
+        
+        if (factor > 0) {
+            // Set gain first
+            switch (gain) {
+                case 1: myScale.setGain(NAU7802_GAIN_1); currentGainSetting = 1; break;
+                case 2: myScale.setGain(NAU7802_GAIN_2); currentGainSetting = 2; break;
+                case 4: myScale.setGain(NAU7802_GAIN_4); currentGainSetting = 4; break;
+                case 8: myScale.setGain(NAU7802_GAIN_8); currentGainSetting = 8; break;
+                case 16: myScale.setGain(NAU7802_GAIN_16); currentGainSetting = 16; break;
+                case 32: myScale.setGain(NAU7802_GAIN_32); currentGainSetting = 32; break;
+                case 64: myScale.setGain(NAU7802_GAIN_64); currentGainSetting = 64; break;
+                case 128: myScale.setGain(NAU7802_GAIN_128); currentGainSetting = 128; break;
+                default:
+                    Serial.printf("Invalid gain %d, using 16x\n", gain);
+                    myScale.setGain(NAU7802_GAIN_16);
+                    currentGainSetting = 16;
+                    gain = 16;
+                    break;
+            }
+            
+            // MUST recalibrate AFE after gain change
+            if (myScale.calibrateAFE()) {
+                Serial.println("✓ AFE recalibrated after gain change");
+            } else {
+                Serial.println("⚠️  AFE calibration failed");
+            }
+            
+            delay(100);
+            
+            // Apply calibration values
+            myScale.setCalibrationFactor(factor);
+            myScale.setZeroOffset(offset);
+            loadCell.saveCalibration();
+            liveData.scaleCalibrated = true;
+            
+            Serial.printf("✓ Calibration values set:\n");
+            Serial.printf("  Factor: %.8f\n", factor);
+            Serial.printf("  Offset: %ld\n", offset);
+            Serial.printf("  Gain: %dx\n", gain);
+        } else {
+            Serial.println("❌ Invalid factor value");
+        }
+    } else {
+        Serial.println("Usage: setcal <factor> <offset> [gain]");
+        Serial.println("Example: setcal 2184.29321289 23198 16");
+    }
+}
+
+void testDifferentGain(int gain) {
+    Serial.printf("\n=== TESTING GAIN %dx ===\n", gain);
+    
+    // Set the requested gain
+    bool gainSet = false;
+    uint8_t oldGain = currentGainSetting; // Save current gain
+    switch (gain) {
+        case 1: gainSet = myScale.setGain(NAU7802_GAIN_1); break;
+        case 2: gainSet = myScale.setGain(NAU7802_GAIN_2); break;
+        case 4: gainSet = myScale.setGain(NAU7802_GAIN_4); break;
+        case 8: gainSet = myScale.setGain(NAU7802_GAIN_8); break;
+        case 16: gainSet = myScale.setGain(NAU7802_GAIN_16); break;
+        case 32: gainSet = myScale.setGain(NAU7802_GAIN_32); break;
+        case 64: gainSet = myScale.setGain(NAU7802_GAIN_64); break;
+        case 128: gainSet = myScale.setGain(NAU7802_GAIN_128); break;
+        default:
+            Serial.printf("Invalid gain %d. Valid: 1,2,4,8,16,32,64,128\n", gain);
+            return;
+    }
+    
+    if (!gainSet) {
+        Serial.printf("❌ Failed to set gain to %dx\n", gain);
+        return;
+    }
+    
+    // Temporarily update gain tracking for testing
+    currentGainSetting = gain;
+    
+    // MUST recalibrate AFE after gain change
+    if (!myScale.calibrateAFE()) {
+        Serial.println("❌ AFE calibration failed");
+        return;
+    }
+    
+    Serial.printf("✓ Gain set to %dx and AFE recalibrated\n", gain);
+    delay(500); // Let it stabilize
+    
+    // Test readings at this gain
+    Serial.println("Testing 5 readings...");
+    int successCount = 0;
+    
+    for (int i = 0; i < 5; i++) {
+        uint32_t startTime = millis();
+        while (!myScale.available() && (millis() - startTime < 100)) {
+            delay(1);
+        }
+        
+        if (myScale.available()) {
+            int32_t reading = myScale.getReading();
+            Serial.printf("  %d: %ld\n", i+1, reading);
+            successCount++;
+        } else {
+            Serial.printf("  %d: TIMEOUT\n", i+1);
+        }
+        delay(100);
+    }
+    
+    Serial.printf("Success rate: %d/5 (%.0f%%)\n", successCount, (successCount * 100.0f) / 5);
+    
+    Serial.printf("=== GAIN %dx TEST COMPLETE ===\n\n", gain);
+    Serial.println("NOTE: This was a test only. Use 'setgain' command to permanently change gain.");
+    
+    // Reset to previous gain
+    currentGainSetting = oldGain;
+    switch (oldGain) {
+        case 1: myScale.setGain(NAU7802_GAIN_1); break;
+        case 2: myScale.setGain(NAU7802_GAIN_2); break;
+        case 4: myScale.setGain(NAU7802_GAIN_4); break;
+        case 8: myScale.setGain(NAU7802_GAIN_8); break;
+        case 16: myScale.setGain(NAU7802_GAIN_16); break;
+        case 32: myScale.setGain(NAU7802_GAIN_32); break;
+        case 64: myScale.setGain(NAU7802_GAIN_64); break;
+        case 128: myScale.setGain(NAU7802_GAIN_128); break;
+    }
+    myScale.calibrateAFE();
+    Serial.printf("Reset to %dx gain\n", oldGain);
+}
+
+void setGainPermanently(int gain) {
+    Serial.printf("\n=== SETTING GAIN TO %dx PERMANENTLY ===\n", gain);
+    
+    // Set the requested gain
+    bool gainSet = false;
+    switch (gain) {
+        case 1: gainSet = myScale.setGain(NAU7802_GAIN_1); break;
+        case 2: gainSet = myScale.setGain(NAU7802_GAIN_2); break;
+        case 4: gainSet = myScale.setGain(NAU7802_GAIN_4); break;
+        case 8: gainSet = myScale.setGain(NAU7802_GAIN_8); break;
+        case 16: gainSet = myScale.setGain(NAU7802_GAIN_16); break;
+        case 32: gainSet = myScale.setGain(NAU7802_GAIN_32); break;
+        case 64: gainSet = myScale.setGain(NAU7802_GAIN_64); break;
+        case 128: gainSet = myScale.setGain(NAU7802_GAIN_128); break;
+        default:
+            Serial.printf("Invalid gain %d. Valid: 1,2,4,8,16,32,64,128\n", gain);
+            return;
+    }
+    
+    if (!gainSet) {
+        Serial.printf("❌ Failed to set gain to %dx\n", gain);
+        return;
+    }
+    
+    // Update our gain tracking and save to EEPROM
+    currentGainSetting = gain;
+    
+    // Save gain setting to EEPROM immediately
+    EEPROM.put(LOCATION_GAIN_SETTING, currentGainSetting);
+    EEPROM.commit();
+    
+    // MUST recalibrate AFE after gain change
+    if (!myScale.calibrateAFE()) {
+        Serial.println("❌ AFE calibration failed");
+        // Don't return - still try to save the setting
+    } else {
+        Serial.println("✓ AFE recalibrated");
+    }
+    
+    Serial.printf("✓ Gain permanently set to %dx and saved to EEPROM\n", gain);
+    Serial.println("⚠️  IMPORTANT: You should recalibrate the scale after changing gain!");
+    Serial.println("Use 'tare' then 'calibrate' commands to recalibrate.");
+    
+    delay(500); // Let it stabilize
+    
+    // Test a few readings
+    Serial.println("Testing 3 readings with new gain...");
+    for (int i = 0; i < 3; i++) {
+        uint32_t startTime = millis();
+        while (!myScale.available() && (millis() - startTime < 100)) {
+            delay(1);
+        }
+        
+        if (myScale.available()) {
+            int32_t reading = myScale.getReading();
+            Serial.printf("  Raw reading %d: %ld\n", i+1, reading);
+        } else {
+            Serial.printf("  Reading %d: TIMEOUT\n", i+1);
+        }
+        delay(200);
+    }
+    
+    Serial.printf("=== GAIN %dx SET PERMANENTLY ===\n\n", gain);
+}
+
+void runMeasurementTest(int numSamples) {
+    Serial.printf("\n=== MEASUREMENT ACCURACY TEST (%d samples) ===\n", numSamples);
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("❌ Scale not calibrated");
+        return;
+    }
+    
+    if (numSamples > 1000) {
+        Serial.println("⚠️  Limiting to 1000 samples for memory");
+        numSamples = 1000;
+    }
+    
+    Serial.println("This test analyzes measurement precision and stability");
+    Serial.println("Keep load constant during the test for best results");
+    Serial.println("Press Enter to start...");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    
+    // Allocate arrays for data
+    float* weights = new float[numSamples];
+    int32_t* rawReadings = new int32_t[numSamples];
+    uint32_t* timestamps = new uint32_t[numSamples];
+    
+    if (!weights || !rawReadings || !timestamps) {
+        Serial.println("❌ Memory allocation failed");
+        return;
+    }
+    
+    Serial.printf("Collecting %d samples (50ms intervals)...\n", numSamples);
+    
+    int validSamples = 0;
+    uint32_t startTime = millis();
+    
+    // Get calibration values once (they shouldn't change during test)
+    int32_t zeroOffset = myScale.getZeroOffset();
+    float calibrationFactor = myScale.getCalibrationFactor();
+    
+    Serial.printf("Using: Zero offset = %ld, Cal factor = %.8f\n", zeroOffset, calibrationFactor);
+    
+    // Check for invalid calibration values
+    if (calibrationFactor == 0.0f || calibrationFactor == 1.0f || isnan(calibrationFactor)) {
+        Serial.println("❌ Invalid calibration factor detected!");
+        Serial.printf("Factor: %.8f, Offset: %ld\n", calibrationFactor, zeroOffset);
+        delete[] weights;
+        delete[] rawReadings;
+        delete[] timestamps;
+        return;
+    }
+    
+    for (int i = 0; i < numSamples; i++) {
+        uint32_t sampleStart = millis();
+        
+        // Wait for scale data
+        int attempts = 0;
+        while (!myScale.available() && attempts < 100) {
+            delay(1);
+            attempts++;
+        }
+        
+        if (myScale.available()) {
+            // Only call getReading() ONCE, then calculate weight manually
+            int32_t rawReading = myScale.getReading();
+            rawReadings[validSamples] = rawReading;
+            
+            // Calculate weight manually - FLIPPED direction to match new calibration
+            weights[validSamples] = -((float)(rawReading - zeroOffset) / calibrationFactor);
+            
+            timestamps[validSamples] = millis() - startTime;
+            validSamples++;
+            
+            // Progress indicator
+            if (i % 20 == 0) {
+                Serial.printf("  Progress: %d/%d (%.1f%%) - Raw: %ld, Weight: %.6f\n", 
+                             i+1, numSamples, ((i+1) * 100.0f) / numSamples, 
+                             rawReading, weights[validSamples-1]);
+            }
+        } else {
+            Serial.printf("  Sample %d: TIMEOUT\n", i+1);
+        }
+        
+        // Wait for 50ms interval
+        while (millis() - sampleStart < 50) {
+            delay(1);
+        }
+    }
+    
+    if (validSamples < 10) {
+        Serial.println("❌ Too few valid samples for analysis");
+        delete[] weights;
+        delete[] rawReadings;
+        delete[] timestamps;
+        return;
+    }
+    
+    // Calculate statistics
+    float weightSum = 0, rawSum = 0;
+    float weightMin = weights[0], weightMax = weights[0];
+    int32_t rawMin = rawReadings[0], rawMax = rawReadings[0];
+    
+    for (int i = 0; i < validSamples; i++) {
+        weightSum += weights[i];
+        rawSum += rawReadings[i];
+        
+        if (weights[i] < weightMin) weightMin = weights[i];
+        if (weights[i] > weightMax) weightMax = weights[i];
+        if (rawReadings[i] < rawMin) rawMin = rawReadings[i];
+        if (rawReadings[i] > rawMax) rawMax = rawReadings[i];
+    }
+    
+    float weightMean = weightSum / validSamples;
+    float rawMean = rawSum / validSamples;
+    
+    // Calculate standard deviation
+    float weightVariance = 0, rawVariance = 0;
+    for (int i = 0; i < validSamples; i++) {
+        float weightDiff = weights[i] - weightMean;
+        float rawDiff = rawReadings[i] - rawMean;
+        weightVariance += weightDiff * weightDiff;
+        rawVariance += rawDiff * rawDiff;
+    }
+    
+    float weightStdDev = sqrt(weightVariance / validSamples);
+    float rawStdDev = sqrt(rawVariance / validSamples);
+    
+    // Calculate resolution and precision
+    float weightRange = weightMax - weightMin;
+    float rawRange = rawMax - rawMin;
+    float measurementTime = timestamps[validSamples-1] / 1000.0f;
+    
+    // Print comprehensive analysis
+    Serial.println("\n=== MEASUREMENT ANALYSIS ===");
+    Serial.printf("Valid samples: %d/%d (%.1f%% success rate)\n", 
+                  validSamples, numSamples, (validSamples * 100.0f) / numSamples);
+    Serial.printf("Test duration: %.2f seconds\n", measurementTime);
+    Serial.printf("Sample rate: %.1f Hz\n", validSamples / measurementTime);
+    
+    Serial.println("\n--- CALIBRATED MEASUREMENTS ---");
+    Serial.printf("Mean weight: %+.6f kg (%+.3f N)\n", weightMean, weightMean * 9.81f);
+    Serial.printf("Min weight:  %+.6f kg (%+.3f N)\n", weightMin, weightMin * 9.81f);
+    Serial.printf("Max weight:  %+.6f kg (%+.3f N)\n", weightMax, weightMax * 9.81f);
+    Serial.printf("Range:       %.6f kg (%.3f N)\n", weightRange, weightRange * 9.81f);
+    Serial.printf("Std Dev:     %.6f kg (%.3f N)\n", weightStdDev, weightStdDev * 9.81f);
+    
+    // Precision analysis
+    if (abs(weightMean) > 0.001) {
+        float precisionPercent = (weightStdDev / abs(weightMean)) * 100.0f;
+        Serial.printf("Precision:   %.6f%% of reading\n", precisionPercent);
+        
+        if (precisionPercent < 0.1) {
+            Serial.println("✓ EXCELLENT precision (<0.1%)");
+        } else if (precisionPercent < 0.5) {
+            Serial.println("✓ GOOD precision (<0.5%)");
+        } else if (precisionPercent < 1.0) {
+            Serial.println("⚠️  FAIR precision (<1.0%)");
+        } else {
+            Serial.println("❌ POOR precision (>1.0%)");
+        }
+    } else {
+        Serial.println("Zero load - precision measured as absolute noise");
+    }
+    
+    Serial.println("\n--- RAW ADC MEASUREMENTS ---");
+    Serial.printf("Mean ADC:    %ld counts\n", (int32_t)rawMean);
+    Serial.printf("Min ADC:     %ld counts\n", rawMin);
+    Serial.printf("Max ADC:     %ld counts\n", rawMax);
+    Serial.printf("Range:       %ld counts\n", rawMax - rawMin);
+    Serial.printf("Std Dev:     %.1f counts\n", rawStdDev);
+    
+    // Resolution analysis
+    float effectiveBits = log2(16777216.0f / rawStdDev); // 24-bit ADC = 2^24
+    Serial.printf("Effective resolution: %.1f bits (of 24-bit ADC)\n", effectiveBits);
+    
+    if (effectiveBits > 20) {
+        Serial.println("✓ EXCELLENT ADC resolution");
+    } else if (effectiveBits > 18) {
+        Serial.println("✓ GOOD ADC resolution");
+    } else if (effectiveBits > 16) {
+        Serial.println("⚠️  FAIR ADC resolution");
+    } else {
+        Serial.println("❌ POOR ADC resolution - check for noise");
+    }
+    
+    // Stability analysis
+    Serial.println("\n--- STABILITY ANALYSIS ---");
+    int stableCount = 0;
+    float tolerance = weightStdDev * 2; // 2-sigma tolerance
+    
+    for (int i = 0; i < validSamples; i++) {
+        if (abs(weights[i] - weightMean) <= tolerance) {
+            stableCount++;
+        }
+    }
+    
+    float stabilityPercent = (stableCount * 100.0f) / validSamples;
+    Serial.printf("Stable readings (±2σ): %d/%d (%.1f%%)\n", 
+                  stableCount, validSamples, stabilityPercent);
+    
+    if (stabilityPercent > 95) {
+        Serial.println("✓ EXCELLENT stability");
+    } else if (stabilityPercent > 90) {
+        Serial.println("✓ GOOD stability");
+    } else if (stabilityPercent > 80) {
+        Serial.println("⚠️  FAIR stability");
+    } else {
+        Serial.println("❌ POOR stability - check for vibration/interference");
+    }
+    
+    // Recommendations
+    Serial.println("\n--- RECOMMENDATIONS ---");
+    if (rawStdDev > 50) {
+        Serial.println("• High noise detected - check power supply and grounding");
+    }
+    if (weightStdDev > 0.001 && abs(weightMean) < 0.1) {
+        Serial.println("• Consider using lower gain for better stability at low loads");
+    }
+    if (validSamples < numSamples * 0.95) {
+        Serial.println("• Communication timeouts detected - check I2C connections");
+    }
+    
+    // Export option
+    Serial.println("\n--- DATA EXPORT ---");
+    Serial.print("Export raw data? (y/n): ");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    char response = Serial.read();
+    
+    if (response == 'y' || response == 'Y') {
+        Serial.println("\nCSV Data (Time_ms, Raw_ADC, Weight_kg, Force_N):");
+        Serial.printf("# Calibration: Factor=%.8f, Offset=%ld\n", calibrationFactor, zeroOffset);
+        Serial.printf("# Sample calculation: (%ld - %ld) / %.8f = %.6f kg\n", 
+                     rawReadings[0], zeroOffset, calibrationFactor, weights[0]);
+        for (int i = 0; i < validSamples; i++) {
+            Serial.printf("%lu,%ld,%.6f,%.3f\n", 
+                         timestamps[i], rawReadings[i], weights[i], weights[i] * 9.81f);
+        }
+    }
+    
+    // Cleanup
+    delete[] weights;
+    delete[] rawReadings;
+    delete[] timestamps;
+    
+    Serial.println("\n=== MEASUREMENT TEST COMPLETE ===\n");
+}
+
+void runSlowDiagnostics() {
+    Serial.println("\n=== SLOW DIAGNOSTICS (30 samples over 3 seconds) ===");
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("Scale not initialized");
+        return;
+    }
+    
+    int successCount = 0;
+    int timeoutCount = 0;
+    int32_t readings[30];
+    bool readingValid[30];
+    
+    Serial.println("Taking 30 readings with 100ms intervals...");
+    
+    for (int i = 0; i < 30; i++) {
+        uint32_t startTime = millis();
+        bool dataReady = false;
+        
+        // Wait up to 100ms for data
+        while ((millis() - startTime < 100) && !dataReady) {
+            if (myScale.available()) {
+                readings[i] = myScale.getReading();
+                readingValid[i] = true;
+                successCount++;
+                dataReady = true;
+                Serial.printf("  %2d: %ld (%.1fms)\n", i+1, readings[i], (millis() - startTime));
+            }
+            delay(1);
+        }
+        
+        if (!dataReady) {
+            readings[i] = 0;
+            readingValid[i] = false;
+            timeoutCount++;
+            Serial.printf("  %2d: TIMEOUT\n", i+1);
+        }
+        
+        delay(100); // 100ms between attempts
+    }
+    
+    Serial.printf("\nResults: %d successful, %d timeouts (%.1f%% success rate)\n", 
+                  successCount, timeoutCount, (successCount * 100.0f) / 30);
+    
+    if (successCount > 5) {
+        // Calculate statistics on valid readings
+        int32_t minVal = readings[0], maxVal = readings[0], sum = 0;
+        int validCount = 0;
+        
+        for (int i = 0; i < 30; i++) {
+            if (readingValid[i]) {
+                if (readings[i] < minVal) minVal = readings[i];
+                if (readings[i] > maxVal) maxVal = readings[i];
+                sum += readings[i];
+                validCount++;
+            }
+        }
+        
+        int32_t average = sum / validCount;
+        Serial.printf("Valid readings - Min: %ld, Max: %ld, Avg: %ld, Range: %ld\n", 
+                      minVal, maxVal, average, maxVal - minVal);
+                      
+        if (successCount < 25) {
+            Serial.println("⚠️  HIGH FAILURE RATE - Check I2C connections and power");
+        }
+        if ((maxVal - minVal) > 50000) {
+            Serial.println("⚠️  HIGH VARIABILITY - Possible noise or hardware issues");
+        }
+    }
+    
+    Serial.println("=== SLOW DIAGNOSTICS COMPLETE ===\n");
+}
+
+void scanI2CDevices() {
+    Serial.println("\n=== I2C DEVICE SCAN ===");
+    
+    int deviceCount = 0;
+    for (uint8_t address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        uint8_t error = Wire.endTransmission();
+        
+        if (error == 0) {
+            Serial.printf("Device found at 0x%02X", address);
+            if (address == 0x2A) Serial.print(" (NAU7802 - CORRECT!)");
+            if (address == 0x30) Serial.print(" (NeoKeys 1x4)");
+            if (address == 0x3D) Serial.print(" (SSD1327 Display)");
+            Serial.println();
+            deviceCount++;
+        }
+    }
+    
+    if (deviceCount == 0) {
+        Serial.println("❌ No I2C devices found!");
+        Serial.println("   Check wiring: SDA, SCL, Power, Ground");
+    } else {
+        Serial.printf("Found %d I2C device(s)\n", deviceCount);
+        if (deviceCount > 1) {
+            Serial.println("   Multiple devices - check for address conflicts");
+        }
+    }
+    
+    Serial.println("=== I2C SCAN COMPLETE ===\n");
+}
+
+void testI2CClockSpeeds() {
+    Serial.println("\n=== I2C CLOCK SPEED TEST ===");
+    
+    uint32_t clockSpeeds[] = {100000, 400000};  // 100kHz, 400kHz
+    const char* speedNames[] = {"100kHz", "400kHz"};
+    
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("Testing %s...\n", speedNames[i]);
+        
+        Wire.setClock(clockSpeeds[i]);
+        delay(100);
+        
+        // Test basic communication
+        Wire.beginTransmission(0x2A);
+        uint8_t error = Wire.endTransmission();
+        
+        if (error == 0) {
+            Serial.printf("  ✓ Communication OK at %s\n", speedNames[i]);
+            
+            // Test a few readings
+            int successCount = 0;
+            for (int j = 0; j < 5; j++) {
+                uint32_t startTime = millis();
+                while (!myScale.available() && (millis() - startTime < 50)) {
+                    delay(1);
+                }
+                if (myScale.available()) {
+                    myScale.getReading();
+                    successCount++;
+                }
+                delay(20);
+            }
+            Serial.printf("  Data readings: %d/5 successful\n", successCount);
+        } else {
+            Serial.printf("  ❌ Communication failed at %s (error: %d)\n", speedNames[i], error);
+        }
+    }
+    
+    // Reset to 400kHz
+    Wire.setClock(400000);
+    Serial.println("Reset to 400kHz");
+    Serial.println("=== CLOCK SPEED TEST COMPLETE ===\n");
+}
+
+void performHardwareReset() {
+    Serial.println("\n=== HARDWARE RESET ===");
+    Serial.println("Performing NAU7802 hardware reset...");
+    
+    if (myScale.reset()) {
+        Serial.println("✓ Hardware reset successful");
+        delay(500);
+        
+        // Reinitialize
+        if (loadCell.initialize()) {
+            Serial.println("✓ Reinitialization successful");
+            liveData.scaleCalibrated = loadCell.loadCalibration();
+        } else {
+            Serial.println("❌ Reinitialization failed");
+            liveData.scaleCalibrated = false;
+        }
+    } else {
+        Serial.println("❌ Hardware reset failed");
+    }
+    
+    Serial.println("=== HARDWARE RESET COMPLETE ===\n");
+}
+
+void performPowerCycle() {
+    Serial.println("\n=== POWER CYCLE TEST ===");
+    Serial.println("Testing power down/up cycle...");
+    
+    if (myScale.powerDown()) {
+        Serial.println("✓ Powered down");
+        delay(1000);
+        
+        if (myScale.powerUp()) {
+            Serial.println("✓ Powered up");
+            delay(500);
+            
+            // Test communication
+            Wire.beginTransmission(0x2A);
+            if (Wire.endTransmission() == 0) {
+                Serial.println("✓ Communication restored");
+                loadCell.configure();
+            } else {
+                Serial.println("❌ Communication failed after power up");
+            }
+        } else {
+            Serial.println("❌ Power up failed");
+        }
+    } else {
+        Serial.println("❌ Power down failed");
+    }
+    
+    Serial.println("=== POWER CYCLE TEST COMPLETE ===\n");
+}
+
+void testTensionCompression() {
+    Serial.println("\n=== TENSION/COMPRESSION TEST ===");
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("❌ Scale not calibrated");
+        return;
+    }
+    
+    Serial.println("This test helps verify your load cell works in both directions");
+    Serial.println("Press Enter to continue...");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    
+    Serial.println("\n1. ZERO TEST");
+    Serial.println("Remove all loads from the load cell");
+    Serial.println("Press Enter when ready...");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    
+    delay(500);
+    float zeroReading = loadCell.getWeight();
+    Serial.printf("Zero reading: %.3f kg\n", zeroReading);
+    
+    Serial.println("\n2. TENSION TEST");
+    Serial.println("Apply tension (hang a weight or pull)");
+    Serial.println("Press Enter when load is applied...");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    
+    delay(500);
+    float tensionReading = loadCell.getWeight();
+    Serial.printf("Tension reading: %.3f kg\n", tensionReading);
+    
+    if (tensionReading > zeroReading + 0.1) {
+        Serial.println("✓ TENSION: Positive direction working");
+    } else {
+        Serial.println("❌ TENSION: No positive change detected");
+    }
+    
+    Serial.println("\n3. COMPRESSION TEST");
+    Serial.println("Apply compression (push down or place weight)");
+    Serial.println("Press Enter when load is applied...");
+    
+    while (Serial.available()) Serial.read();
+    while (Serial.available() == 0) delay(10);
+    
+    delay(500);
+    float compressionReading = loadCell.getWeight();
+    Serial.printf("Compression reading: %.3f kg\n", compressionReading);
+    
+    if (compressionReading < zeroReading - 0.1) {
+        Serial.println("✓ COMPRESSION: Negative direction working");
+    } else {
+        Serial.println("❌ COMPRESSION: No negative change detected");
+    }
+    
+    Serial.println("\n=== SUMMARY ===");
+    Serial.printf("Zero: %.3f kg\n", zeroReading);
+    Serial.printf("Tension: %.3f kg (change: %+.3f)\n", tensionReading, tensionReading - zeroReading);
+    Serial.printf("Compression: %.3f kg (change: %+.3f)\n", compressionReading, compressionReading - zeroReading);
+    
+    bool tensionWorking = (tensionReading > zeroReading + 0.1);
+    bool compressionWorking = (compressionReading < zeroReading - 0.1);
+    
+    if (tensionWorking && compressionWorking) {
+        Serial.println("✓ BOTH DIRECTIONS WORKING - Load cell properly calibrated!");
+    } else if (tensionWorking) {
+        Serial.println("⚠️  Only tension working - check compression setup");
+    } else if (compressionWorking) {
+        Serial.println("⚠️  Only compression working - check tension setup");
+    } else {
+        Serial.println("❌ Neither direction working properly - check calibration");
+    }
+    
+    Serial.println("=== TEST COMPLETE ===\n");
+}
+
+// ===== SETUP FUNCTION =====
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n🚀 ESP32 Universal Testing Machine - UTM_REV3");
+    Serial.println("==================================================================");
+
+    // Initialize EEPROM
+    EEPROM.begin(EEPROM_SIZE);
+
+    // Initialize Event Groups
+    testEventFlags = xEventGroupCreate();
+    if (testEventFlags == NULL) {
+        Serial.println("❌ Failed to create event group!");
+        while(1) delay(1000);
+    }
+
+    // GPIO initialization
+    pinMode(STEP, OUTPUT);
+    pinMode(DIR, OUTPUT);
+    pinMode(EN, OUTPUT);
+    digitalWrite(STEP, LOW);
+    digitalWrite(DIR, HIGH);
+    digitalWrite(EN, LOW);
+    Serial.println("✓ GPIO initialized");
+
+    // Initialize load cell
+    if (loadCell.initialize()) {
+        liveData.scaleCalibrated = loadCell.loadCalibration();
+        if (liveData.scaleCalibrated) {
+            Serial.println("✓ Load cell ready with saved calibration (persists through restart)");
+            Serial.printf("  Gain: %dx, Factor: %.3f, Offset: %ld\n", 
+                         getCurrentGain(), myScale.getCalibrationFactor(), myScale.getZeroOffset());
+        } else {
+            Serial.println("⚠️  Load cell detected but needs calibration");
+            Serial.printf("  Current gain: %dx (default)\n", getCurrentGain());
+        }
+    } else {
+        Serial.println("⚠️  Load cell not detected - continuing without");
+        liveData.scaleCalibrated = false;
+    }
+
+    // Initialize 128x128 display
+    if (!display.begin(0x3D)) {
+        Serial.println("❌ 128x128 OLED initialization failed!");
+    } else {
+        Serial.println("✓ 128x128 Grayscale OLED display initialized");
+    }
+    display.setRotation(0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE);
+
+    // Initialize NeoKeys
+    initializeNeoKeys();
+
+    // Create tasks with optimized priorities and core assignments
+    xTaskCreatePinnedToCore(neokeyTask, "NeoKeyTask", 4096, NULL, 3, &neokeyTaskHandle, 0);     // High priority on Core 0
+    xTaskCreatePinnedToCore(dataAcquisitionTask, "DataTask", 8192, NULL, 2, &dataTaskHandle, 1); // Core 1
+    xTaskCreatePinnedToCore(uiTask, "UITask", 8192, NULL, 1, &uiTaskHandle, 1);                  // Core 1
+    
+    Serial.println("✓ Tasks created successfully with optimized priorities:");
+    Serial.println("  • NeoKey Task: Core 0, Priority 3 (1000Hz)");
+    Serial.println("  • Data Task: Core 1, Priority 2 (80Hz)");
+    Serial.println("  • UI Task: Core 1, Priority 1 (20Hz)");
+    Serial.println("\n🎯 System ready! Ultra-responsive NeoKeys");
+    Serial.println("🚨 During test: All keys = E-STOP (shows results)");
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("\n📝 Setup: diag → calibrate → test");
+    }
+    
+    Serial.println("\n🧪 TEST MODES:");
+    Serial.println("  • Ultimate: Simple break detection (50% drop for 5s)");
+    Serial.println("  • Modulus: Full memory, microSD logging (coming soon)");
+    Serial.println("  • Rates: 5mm/min, 1mm/min at 80Hz");
+    Serial.println();
+}
+
+// ===== MAIN LOOP =====
+void loop() {
+    static unsigned long lastScaleRead = 0;
+    const unsigned long scaleReadInterval = 50; // Read scale every 50ms (20Hz)
+    
+    // Handle scale reading on Core 0 (away from timer interrupts)
+    if (liveData.scaleCalibrated && (millis() - lastScaleRead >= scaleReadInterval)) {
+        float newForce = loadCell.getForceN();
+        if (newForce != 0.0f || !liveData.testActive) { // Update if valid reading or not testing
+            liveData.currentForce_N = newForce;
+            
+            // Peak tracking is now handled entirely in data acquisition task
+            // to ensure position and time are recorded together
+        }
+        lastScaleRead = millis();
+    }
+    
+    // Handle tare requests (moved from data acquisition task)
+    EventBits_t bits = xEventGroupGetBits(testEventFlags);
+    if (bits & EVT_TARE_REQUEST) {
+        loadCell.tare();
+        xEventGroupClearBits(testEventFlags, EVT_TARE_REQUEST);
+    }
+    
+    // Handle serial commands
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        handleSerialCommand(command);
+    }
+    
+    // Main loop runs on Core 0 - keep it light but handle scale reading
+    vTaskDelay(pdMS_TO_TICKS(10)); // 10ms delay = 100Hz loop rate
+}
