@@ -1,0 +1,486 @@
+/*
+  Load Cell Testing Code for 2000kg S-Beam Load Cell
+  Modified from SparkFun Qwiic Scale Example
+  
+  Features:
+  - Appropriate gain setting for large load cells (300-800lb range)
+  - Controlled data collection instead of continuous spam
+  - Data collection commands for analysis
+  - Handles both compression and tension readings
+*/
+
+#include <Wire.h>
+#include <EEPROM.h>
+
+#include "SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h"
+
+NAU7802 myScale;
+
+// EEPROM locations to store 4-byte variables
+#define EEPROM_SIZE 100
+#define LOCATION_CALIBRATION_FACTOR 0
+#define LOCATION_ZERO_OFFSET 10
+
+bool settingsDetected = false;
+
+// Data collection variables
+#define MAX_SAMPLES 100
+float dataBuffer[MAX_SAMPLES];
+int sampleCount = 0;
+unsigned long sampleInterval = 100; // milliseconds between samples
+bool isCollecting = false;
+
+void setup()
+{
+  EEPROM.begin(EEPROM_SIZE);
+  
+  Serial.begin(115200);
+  Serial.println("Load Cell Testing - 2000kg S-Beam");
+  Serial.println("=====================================");
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  if (myScale.begin() == false)
+  {
+    Serial.println("Scale not detected. Please check wiring. Freezing...");
+    while (1);
+  }
+  Serial.println("Scale detected!");
+
+  // Configure for large load cell (2000kg)
+  // Start with gain of 16 - good for heavy loads
+  myScale.setGain(NAU7802_GAIN_16);
+  
+  // Use moderate sample rate for stability
+  myScale.setSampleRate(NAU7802_SPS_80);
+  
+  // Calibrate analog front end after changing settings
+  myScale.calibrateAFE();
+
+  readSystemSettings();
+
+  Serial.print("Zero offset: ");
+  Serial.println(myScale.getZeroOffset());
+  Serial.print("Calibration factor: ");
+  Serial.println(myScale.getCalibrationFactor());
+  Serial.print("Current gain: ");
+  Serial.println("16x (appropriate for 2000kg load cell)");
+
+  printMenu();
+}
+
+void loop()
+{
+  // Handle data collection
+  if (isCollecting && myScale.available())
+  {
+    static unsigned long lastSample = 0;
+    if (millis() - lastSample >= sampleInterval)
+    {
+      float weight = myScale.getWeight(true); // Allow negative weights!
+      dataBuffer[sampleCount] = weight;
+      sampleCount++;
+      lastSample = millis();
+      
+      Serial.print("Sample ");
+      Serial.print(sampleCount);
+      Serial.print("/");
+      Serial.print(MAX_SAMPLES);
+      Serial.print(": ");
+      Serial.print(weight, 3);
+      Serial.println(" units");
+      
+      if (sampleCount >= MAX_SAMPLES)
+      {
+        isCollecting = false;
+        Serial.println("\nData collection complete!");
+        analyzeData();
+        printMenu();
+      }
+    }
+  }
+
+  // Handle user commands
+  if (Serial.available())
+  {
+    char command = Serial.read();
+    
+    switch (command)
+    {
+      case 'r': // Single reading
+        singleReading();
+        break;
+        
+      case 'm': // Measure/collect data
+        startDataCollection();
+        break;
+        
+      case 't': // Tare
+        Serial.println("Taring scale...");
+        myScale.calculateZeroOffset(64);
+        Serial.print("New zero offset: ");
+        Serial.println(myScale.getZeroOffset());
+        break;
+        
+      case 'c': // Calibrate
+        calibrateScale();
+        break;
+        
+      case 'g': // Change gain
+        changeGain();
+        break;
+        
+      case 's': // Show statistics
+        if (sampleCount > 0)
+          analyzeData();
+        else
+          Serial.println("No data collected yet. Use 'm' to collect data.");
+        break;
+        
+      case 'h': // Help
+        printMenu();
+        break;
+        
+      case 'z': // Zero test (raw reading)
+        zeroTest();
+        break;
+        
+      case 'e': // Export calibration values
+        exportCalibration();
+        break;
+        
+      default:
+        if (command > 32) // Ignore control characters
+        {
+          Serial.print("Unknown command: ");
+          Serial.println(command);
+          printMenu();
+        }
+        break;
+    }
+  }
+}
+
+void printMenu()
+{
+  Serial.println("\n=== Commands ===");
+  Serial.println("r - Single reading");
+  Serial.println("m - Measure (collect 100 samples)");
+  Serial.println("t - Tare (zero) the scale");
+  Serial.println("c - Calibrate scale");
+  Serial.println("g - Change gain setting");
+  Serial.println("s - Show data statistics");
+  Serial.println("z - Zero test (raw readings)");
+  Serial.println("e - Export calibration values");
+  Serial.println("h - Show this menu");
+  Serial.println("================\n");
+}
+
+void singleReading()
+{
+  if (myScale.available())
+  {
+    int32_t rawReading = myScale.getReading();
+    float weight = myScale.getWeight();
+    
+    Serial.println("--- Single Reading ---");
+    Serial.print("Raw: ");
+    Serial.println(rawReading);
+    Serial.print("Weight: ");
+    Serial.print(weight, 3);
+    Serial.println(" units");
+    
+    if (!settingsDetected)
+    {
+      Serial.println("Scale not calibrated. Use 'c' to calibrate.");
+    }
+    Serial.println("---------------------\n");
+  }
+  else
+  {
+    Serial.println("Scale not ready, try again.");
+  }
+}
+
+void startDataCollection()
+{
+  Serial.print("Starting data collection (");
+  Serial.print(MAX_SAMPLES);
+  Serial.print(" samples at ");
+  Serial.print(sampleInterval);
+  Serial.println("ms intervals)...");
+  Serial.println("Press any key to stop early.\n");
+  
+  sampleCount = 0;
+  isCollecting = true;
+  
+  // Clear any pending serial data
+  while (Serial.available()) Serial.read();
+}
+
+void analyzeData()
+{
+  if (sampleCount == 0)
+  {
+    Serial.println("No data to analyze.");
+    return;
+  }
+  
+  float sum = 0;
+  float min_val = dataBuffer[0];
+  float max_val = dataBuffer[0];
+  
+  for (int i = 0; i < sampleCount; i++)
+  {
+    sum += dataBuffer[i];
+    if (dataBuffer[i] < min_val) min_val = dataBuffer[i];
+    if (dataBuffer[i] > max_val) max_val = dataBuffer[i];
+  }
+  
+  float average = sum / sampleCount;
+  
+  // Calculate standard deviation
+  float variance = 0;
+  for (int i = 0; i < sampleCount; i++)
+  {
+    variance += pow(dataBuffer[i] - average, 2);
+  }
+  variance /= sampleCount;
+  float std_dev = sqrt(variance);
+  
+  Serial.println("\n=== DATA ANALYSIS ===");
+  Serial.print("Samples: ");
+  Serial.println(sampleCount);
+  Serial.print("Average: ");
+  Serial.print(average, 4);
+  Serial.println(" units");
+  Serial.print("Min: ");
+  Serial.print(min_val, 4);
+  Serial.println(" units");
+  Serial.print("Max: ");
+  Serial.print(max_val, 4);
+  Serial.println(" units");
+  Serial.print("Range: ");
+  Serial.print(max_val - min_val, 4);
+  Serial.println(" units");
+  Serial.print("Std Dev: ");
+  Serial.print(std_dev, 4);
+  Serial.println(" units");
+  Serial.print("Noise (% of reading): ");
+  if (average != 0)
+    Serial.print((std_dev / abs(average)) * 100, 2);
+  else
+    Serial.print("N/A (zero reading)");
+  Serial.println("%");
+  
+  // Print CSV data for analysis FIRST
+  Serial.println("CSV Data (copy to spreadsheet):");
+  Serial.println("Sample,Value");
+  for (int i = 0; i < sampleCount; i++)
+  {
+    Serial.print(i + 1);
+    Serial.print(",");
+    Serial.println(dataBuffer[i], 6);
+  }
+  Serial.println();
+  
+  Serial.println("=====================\n");
+}
+
+void changeGain()
+{
+  Serial.println("Current gain options for 2000kg load cell:");
+  Serial.println("1 - Gain 1x  (highest capacity, lowest resolution)");
+  Serial.println("2 - Gain 2x");
+  Serial.println("4 - Gain 4x");
+  Serial.println("8 - Gain 8x");
+  Serial.println("16 - Gain 16x (current - recommended)");
+  Serial.println("32 - Gain 32x");
+  Serial.println("64 - Gain 64x");
+  Serial.println("128 - Gain 128x (may saturate with heavy loads)");
+  Serial.print("Enter gain value: ");
+  
+  while (Serial.available()) Serial.read(); // Clear buffer
+  while (Serial.available() == 0) delay(10); // Wait for input
+  
+  int gain = Serial.parseInt();
+  
+  switch (gain)
+  {
+    case 1:
+      myScale.setGain(NAU7802_GAIN_1);
+      break;
+    case 2:
+      myScale.setGain(NAU7802_GAIN_2);
+      break;
+    case 4:
+      myScale.setGain(NAU7802_GAIN_4);
+      break;
+    case 8:
+      myScale.setGain(NAU7802_GAIN_8);
+      break;
+    case 16:
+      myScale.setGain(NAU7802_GAIN_16);
+      break;
+    case 32:
+      myScale.setGain(NAU7802_GAIN_32);
+      break;
+    case 64:
+      myScale.setGain(NAU7802_GAIN_64);
+      break;
+    case 128:
+      myScale.setGain(NAU7802_GAIN_128);
+      break;
+    default:
+      Serial.println("Invalid gain. Using 16x.");
+      myScale.setGain(NAU7802_GAIN_16);
+      gain = 16;
+      break;
+  }
+  
+  myScale.calibrateAFE(); // Recalibrate after gain change
+  
+  Serial.print("Gain set to ");
+  Serial.print(gain);
+  Serial.println("x");
+  Serial.println("Note: You may need to re-tare and re-calibrate after changing gain.");
+}
+
+void zeroTest()
+{
+  Serial.println("Raw reading test (10 samples):");
+  Serial.println("This shows uncalibrated ADC values - useful for checking basic functionality");
+  
+  for (int i = 0; i < 10; i++)
+  {
+    if (myScale.available())
+    {
+      int32_t raw = myScale.getReading();
+      Serial.print("Raw ");
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.println(raw);
+      delay(200);
+    }
+  }
+  Serial.println("If values are changing with applied force, load cell is working.\n");
+}
+
+void calibrateScale(void)
+{
+  Serial.println("\n=== SCALE CALIBRATION ===");
+  Serial.println("This will calibrate for your specific load cell and setup.");
+
+  Serial.println("Step 1: Remove all weight from load cell. Press any key when ready.");
+  while (Serial.available()) Serial.read();
+  while (Serial.available() == 0) delay(10);
+
+  myScale.calculateZeroOffset(64);
+  Serial.print("New zero offset: ");
+  Serial.println(myScale.getZeroOffset());
+
+  Serial.println("Step 2: Apply a known weight to load cell.");
+  Serial.println("For tension testing: hang a known weight");
+  Serial.println("For compression testing: place a known weight on top");
+  Serial.println("Press any key when weight is stable.");
+  while (Serial.available()) Serial.read();
+  while (Serial.available() == 0) delay(10);
+
+  Serial.print("Enter the weight value (in your desired units, e.g., pounds): ");
+  while (Serial.available()) Serial.read();
+  while (Serial.available() == 0) delay(10);
+
+  float knownWeight = Serial.parseFloat();
+  Serial.println();
+
+  myScale.calculateCalibrationFactor(knownWeight, 64);
+  Serial.print("New calibration factor: ");
+  Serial.println(myScale.getCalibrationFactor(), 6);
+
+  Serial.print("Test reading: ");
+  Serial.print(myScale.getWeight(), 3);
+  Serial.println(" units");
+
+  recordSystemSettings();
+  settingsDetected = true;
+  
+  Serial.println("Calibration complete!");
+  Serial.println("=========================\n");
+}
+
+void recordSystemSettings(void)
+{
+  EEPROM.put(LOCATION_CALIBRATION_FACTOR, myScale.getCalibrationFactor());
+  EEPROM.put(LOCATION_ZERO_OFFSET, myScale.getZeroOffset());
+  EEPROM.commit();
+}
+
+void readSystemSettings(void)
+{
+  float settingCalibrationFactor;
+  int32_t settingZeroOffset;
+
+  EEPROM.get(LOCATION_CALIBRATION_FACTOR, settingCalibrationFactor);
+  if (settingCalibrationFactor == 0xFFFFFFFF)
+  {
+    settingCalibrationFactor = 1.0;
+    EEPROM.put(LOCATION_CALIBRATION_FACTOR, settingCalibrationFactor);
+  }
+
+  EEPROM.get(LOCATION_ZERO_OFFSET, settingZeroOffset);
+  if (settingZeroOffset == 0xFFFFFFFF)
+  {
+    settingZeroOffset = 0;
+    EEPROM.put(LOCATION_ZERO_OFFSET, settingZeroOffset);
+  }
+
+  myScale.setCalibrationFactor(settingCalibrationFactor);
+  myScale.setZeroOffset(settingZeroOffset);
+
+  settingsDetected = true;
+  if (settingCalibrationFactor == 1.0 || settingZeroOffset == 0)
+    settingsDetected = false;
+}
+
+void exportCalibration()
+{
+  Serial.println("\n=== CALIBRATION VALUES FOR EXPORT ===");
+  Serial.println("Copy these values to use in other Arduino code:");
+  Serial.println();
+  
+  Serial.println("// Load cell calibration values");
+  Serial.print("float calibrationFactor = ");
+  Serial.print(myScale.getCalibrationFactor(), 8);
+  Serial.println(";");
+  
+  Serial.print("int32_t zeroOffset = ");
+  Serial.print(myScale.getZeroOffset());
+  Serial.println(";");
+  
+  Serial.println();
+  Serial.println("// To use these values in your code:");
+  Serial.println("myScale.setCalibrationFactor(calibrationFactor);");
+  Serial.println("myScale.setZeroOffset(zeroOffset);");
+  
+  Serial.println();
+  Serial.println("// Current gain setting:");
+  Serial.println("myScale.setGain(NAU7802_GAIN_16); // Current setting");
+  Serial.println("myScale.setSampleRate(NAU7802_SPS_80); // Current setting");
+  Serial.println("myScale.calibrateAFE(); // Always call after changing gain/sample rate");
+  
+  Serial.println();
+  Serial.println("// Example usage in setup():");
+  Serial.println("if (myScale.begin() == false) {");
+  Serial.println("  Serial.println(\"Scale not detected\");");
+  Serial.println("  while (1);");
+  Serial.println("}");
+  Serial.println("myScale.setGain(NAU7802_GAIN_16);");
+  Serial.println("myScale.setSampleRate(NAU7802_SPS_80);");
+  Serial.println("myScale.calibrateAFE();");
+  Serial.println("myScale.setCalibrationFactor(calibrationFactor);");
+  Serial.println("myScale.setZeroOffset(zeroOffset);");
+  Serial.println();
+  Serial.println("// Then use: float weight = myScale.getWeight(true);");
+  Serial.println("======================================\n");
+}
