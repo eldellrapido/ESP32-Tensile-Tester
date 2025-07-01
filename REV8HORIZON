@@ -1,0 +1,3082 @@
+/*
+ESP32 Universal Testing Machine - WiFi Control Only
+- NAU7802 load cell with 80Hz data acquisition
+- Web-based control interface (Red theme, compact design)
+- Ultimate and Modulus test modes with CSV logging
+- Real-time data streaming during tests
+- Fixed motor control with precise distance-based jogging
+- Web-based calibration and setup tools
+- Enhanced file management with delete functionality
+- Comprehensive test results with elongation and failure analysis
+- IMPROVED: Enhanced test end logic, absolute force values, live current force display
+*/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include "driver/gpio.h"
+#include "soc/gpio_reg.h"
+#include "SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h"
+#include <SD.h>
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+
+// ===== HARDWARE CONFIGURATION =====
+// Load Cell
+NAU7802 myScale;
+uint8_t currentGainSetting = 16;
+
+// MicroSD Card
+#define SD_CS 10
+
+// WiFi and Web Server
+DNSServer dnsServer;
+WebServer server(80);
+String apSSID = "UTM-Controller";
+String apPassword = "testing123";
+
+// GPIO Pins
+const int DIR = 16;
+const int STEP = 15;
+const int EN = 14;
+
+// Motor Parameters
+const int MICRO_STEPS = 8;
+const int GEAR_RATIO = 50;
+const int MOTOR_STEPS_PER_REV = 200 * MICRO_STEPS;
+const int OUTPUT_STEPS_PER_REV = MOTOR_STEPS_PER_REV * GEAR_RATIO;
+
+// Mechanical Parameters
+const float MM_PER_REV = 8.0f;
+const float MM_PER_STEP = MM_PER_REV / OUTPUT_STEPS_PER_REV;
+
+// EEPROM Configuration
+#define EEPROM_SIZE 100
+#define LOCATION_CALIBRATION_FACTOR 0
+#define LOCATION_ZERO_OFFSET 10
+#define LOCATION_SETTINGS_VALID 20
+#define LOCATION_GAIN_SETTING 30
+
+// ===== ENUMS =====
+enum SystemState {
+    STATE_IDLE,
+    STATE_JOG,
+    STATE_TEST,
+    STATE_WIFI_ACTIVE
+};
+
+enum TestMode {
+    TEST_MODULUS = 0  // Only modulus test mode
+};
+
+// ===== DATA STRUCTURES =====
+struct TestDataPoint {
+    uint64_t timestamp_us;
+    float force_N;
+    float position_mm;
+    uint32_t step_count;
+    bool valid;
+};
+
+struct LiveTestData {
+    float currentForce_N;
+    float peakForce_N;
+    float peakForcePosition_mm;
+    float currentPosition_mm;
+    float testStartPosition_mm;
+    float breakPosition_mm;
+    float breakForce_N;
+    uint64_t breakTime_us;
+    uint32_t totalSteps;
+    uint64_t testStartTime_us;
+    uint64_t testEndTime_us;
+    uint64_t peakForceTime_us;
+    bool testActive;
+    bool scaleCalibrated;
+    bool bufferOverflow;
+    bool sensorSaturated;
+    bool scaleError;
+    bool sdCardAvailable;
+    uint32_t forceDropCounter;  // ENHANCED: Now tracks low force readings
+    bool breakDetected;
+    uint32_t peakDataIndex;
+    uint32_t lowForceCounter;   // NEW: Counter for force below threshold detection
+    bool testHasReachedThreshold; // NEW: Flag to track if test has reached meaningful force
+};
+
+// ===== GLOBAL VARIABLES =====
+// Data Buffer
+#define BUFFER_SIZE 1000   // Smaller buffer since we're streaming to SD
+#define ROLLING_BUFFER_SIZE 500
+#define SD_WRITE_INTERVAL 10  // Write to SD every 10 data points for better performance
+
+TestDataPoint dataBuffer[BUFFER_SIZE];
+volatile uint16_t bufferWriteIndex = 0;
+volatile bool bufferWrapped = false;
+volatile uint32_t totalDataPoints = 0;
+
+// CSV Logging
+File csvFile;
+String currentTestFilename = "";
+bool csvLoggingActive = false;
+
+// Live Data
+LiveTestData liveData = {0};
+
+// FreeRTOS
+EventGroupHandle_t testEventFlags;
+#define EVT_TEST_START       (1 << 0)
+#define EVT_TEST_STOP        (1 << 1)
+#define EVT_TARE_REQUEST     (1 << 4)
+#define EVT_DATA_READY       (1 << 5)
+
+// Hardware Timer
+hw_timer_t* stepTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Motor Control - FIXED
+volatile bool moveStepper = false;
+volatile uint32_t stepperSpeed = 1000;
+volatile bool stepperDir = true;
+volatile uint32_t stepsTaken = 0;
+volatile uint16_t totalRotations = 0;
+volatile bool motorEnabled = true;
+volatile bool stepState = false;
+volatile bool timerRunning = false;
+volatile int32_t jogStepCounter = 0;
+
+// Fixed jog control variables
+volatile bool jogActive = false;
+volatile uint32_t jogTargetSteps = 0;
+volatile uint32_t jogCurrentSteps = 0;
+
+// Task Handles
+TaskHandle_t dataTaskHandle = NULL;
+
+// System State
+SystemState currentState = STATE_WIFI_ACTIVE;
+float testRateOptions_mmpm[] = {5.0f, 1.0f};
+uint8_t testRateIndex = 0;
+float jogRateOptions_mmps[] = {0.2f, 0.4f, 0.8f}; // mm/s jog rates
+uint8_t jogRateIndex = 1; // Default to 0.4 mm/s
+TestMode currentTestMode = TEST_MODULUS;
+
+// Device availability
+bool loadCellAvailable = false;
+
+// ENHANCED: Test end detection parameters
+const float LOW_FORCE_THRESHOLD = 30.0f;  // ±30N threshold
+const float TEST_FORCE_THRESHOLD = 50.0f; // Must reach this force before auto-end logic activates
+const uint32_t LOW_FORCE_TIMEOUT_MS = 10000;  // 10 seconds
+const uint32_t LOW_FORCE_CHECK_RATE_HZ = 80;  // 80Hz data rate
+const uint32_t LOW_FORCE_COUNT_THRESHOLD = (LOW_FORCE_TIMEOUT_MS * LOW_FORCE_CHECK_RATE_HZ) / 1000;  // ~800 counts
+
+// ===== UTILITY FUNCTIONS =====
+uint32_t getStepsTakenSafe() {
+    portENTER_CRITICAL(&timerMux);
+    uint32_t steps = stepsTaken;
+    portEXIT_CRITICAL(&timerMux);
+    return steps;
+}
+
+const char* getTestModeString(TestMode mode) {
+    switch (mode) {
+        case TEST_MODULUS: return "Modulus";
+        default: return "Unknown";
+    }
+}
+
+float getCurrentTestRate_mmps() {
+    return testRateOptions_mmpm[testRateIndex] / 60.0f;
+}
+
+// ENHANCED: Force processing function to ensure positive values
+float processForceReading(float rawForce) {
+    // Convert to absolute value to ensure always positive regardless of tension/compression
+    return abs(rawForce);
+}
+
+// ===== LOAD CELL FUNCTIONS =====
+bool initLoadCell() {
+    Wire.setClock(100000);
+    delay(100);
+    
+    bool initSuccess = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (myScale.begin()) {
+            initSuccess = true;
+            break;
+        }
+        delay(200);
+    }
+    
+    if (!initSuccess) return false;
+    
+    myScale.setGain(NAU7802_GAIN_16);
+    currentGainSetting = 16;
+    myScale.setSampleRate(NAU7802_SPS_80);
+    myScale.setLDO(NAU7802_LDO_3V0);
+    
+    if (!myScale.calibrateAFE()) {
+        Serial.println("AFE calibration failed");
+        return false;
+    }
+    
+    delay(500);
+    Wire.setClock(400000);
+    delay(100);
+    
+    return true;
+}
+
+bool loadCalibration() {
+    float calibrationFactor;
+    int32_t zeroOffset;
+    uint8_t savedGain;
+    bool settingsValid;
+    
+    EEPROM.get(LOCATION_SETTINGS_VALID, settingsValid);
+    if (!settingsValid) return false;
+    
+    EEPROM.get(LOCATION_CALIBRATION_FACTOR, calibrationFactor);
+    if (isnan(calibrationFactor) || calibrationFactor <= 0) return false;
+    
+    EEPROM.get(LOCATION_ZERO_OFFSET, zeroOffset);
+    EEPROM.get(LOCATION_GAIN_SETTING, savedGain);
+    
+    if (savedGain != 1 && savedGain != 2 && savedGain != 4 && savedGain != 8 && 
+        savedGain != 16 && savedGain != 32 && savedGain != 64 && savedGain != 128) {
+        savedGain = 16;
+    }
+    
+    switch (savedGain) {
+        case 1: myScale.setGain(NAU7802_GAIN_1); break;
+        case 2: myScale.setGain(NAU7802_GAIN_2); break;
+        case 4: myScale.setGain(NAU7802_GAIN_4); break;
+        case 8: myScale.setGain(NAU7802_GAIN_8); break;
+        case 16: myScale.setGain(NAU7802_GAIN_16); break;
+        case 32: myScale.setGain(NAU7802_GAIN_32); break;
+        case 64: myScale.setGain(NAU7802_GAIN_64); break;
+        case 128: myScale.setGain(NAU7802_GAIN_128); break;
+        default: myScale.setGain(NAU7802_GAIN_16); savedGain = 16; break;
+    }
+    currentGainSetting = savedGain;
+    
+    if (!myScale.calibrateAFE()) {
+        Serial.println("AFE calibration failed after restoring gain");
+    }
+    
+    myScale.setCalibrationFactor(calibrationFactor);
+    myScale.setZeroOffset(zeroOffset);
+    
+    Serial.printf("Loaded calibration: factor=%.3f, offset=%ld, gain=%dx\n", 
+                  calibrationFactor, zeroOffset, savedGain);
+    
+    return true;
+}
+
+void saveCalibration() {
+    EEPROM.put(LOCATION_CALIBRATION_FACTOR, myScale.getCalibrationFactor());
+    EEPROM.put(LOCATION_ZERO_OFFSET, myScale.getZeroOffset());
+    EEPROM.put(LOCATION_GAIN_SETTING, currentGainSetting);
+    
+    bool settingsValid = true;
+    EEPROM.put(LOCATION_SETTINGS_VALID, settingsValid);
+    
+    EEPROM.commit();
+    Serial.printf("Calibration saved (Factor: %.3f, Offset: %ld, Gain: %dx)\n", 
+                 myScale.getCalibrationFactor(), myScale.getZeroOffset(), currentGainSetting);
+}
+
+float getForceN() {
+    if (!loadCellAvailable) return 0.0f;
+    
+    // Give more time for NAU7802 to have data ready
+    uint32_t startTime = millis();
+    while (!myScale.available() && (millis() - startTime < 100)) {
+        delay(1);
+    }
+    
+    if (!myScale.available()) {
+        liveData.scaleError = true;
+        return 0.0f;
+    }
+    
+    int32_t rawReading = myScale.getReading();
+    int32_t zeroOffset = myScale.getZeroOffset();
+    float calibrationFactor = myScale.getCalibrationFactor();
+    
+    // Check for invalid calibration
+    if (calibrationFactor == 0.0f || isnan(calibrationFactor)) {
+        liveData.scaleError = true;
+        return 0.0f;
+    }
+    
+    // Check for saturated readings (close to 24-bit max)
+    if (abs(rawReading) > 8000000) {
+        liveData.sensorSaturated = true;
+        return 0.0f;
+    }
+    
+    float weight = -((float)(rawReading - zeroOffset) / calibrationFactor);
+    
+    // Sanity check - reject unreasonable readings
+    if (abs(weight) > 1000.0f) { // > 1000kg is unreasonable
+        liveData.scaleError = true;
+        return 0.0f;
+    }
+    
+    liveData.scaleError = false;
+    liveData.sensorSaturated = false;
+    
+    float forceN = weight * 9.81f; // Convert to Newtons
+    
+    // ENHANCED: Process force to ensure positive values
+    return processForceReading(forceN);
+}
+
+void performTare() {
+    if (!loadCellAvailable) return;
+    
+    Serial.println("Taring scale...");
+    
+    int32_t total = 0;
+    int validReadings = 0;
+    int attempts = 0;
+    const int maxAttempts = 200; // Try up to 200 times
+    
+    while (validReadings < 32 && attempts < maxAttempts) {
+        delay(25); // Slower polling for better reliability
+        attempts++;
+        
+        // Wait for data to be available
+        uint32_t startWait = millis();
+        while (!myScale.available() && (millis() - startWait < 50)) {
+            delay(1);
+        }
+        
+        if (myScale.available()) {
+            int32_t reading = myScale.getReading();
+            // Basic sanity check - reject obviously bad readings
+            if (abs(reading) < 16000000) { // Well below 24-bit saturation
+                total += reading;
+                validReadings++;
+                
+                if (validReadings % 8 == 0) {
+                    Serial.printf("Tare progress: %d/32 readings\n", validReadings);
+                }
+            }
+        }
+    }
+    
+    if (validReadings >= 16) { // Need at least half the target readings
+        int32_t newZeroOffset = total / validReadings;
+        myScale.setZeroOffset(newZeroOffset);
+        saveCalibration();
+        Serial.printf("Tare complete: %ld (from %d readings)\n", newZeroOffset, validReadings);
+    } else {
+        Serial.printf("Tare failed - only got %d/%d readings after %d attempts\n", 
+                     validReadings, 32, attempts);
+        Serial.println("Check NAU7802 connections and power supply");
+    }
+}
+
+// ===== SD CARD FUNCTIONS =====
+bool initializeSDCard() {
+    if (!SD.begin(SD_CS)) {
+        Serial.println("SD Card initialization failed");
+        liveData.sdCardAvailable = false;
+        return false;
+    }
+    
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("No SD card attached");
+        liveData.sdCardAvailable = false;
+        return false;
+    }
+    
+    Serial.println("SD Card initialized successfully");
+    liveData.sdCardAvailable = true;
+    return true;
+}
+
+String generateTestFilename() {
+    static uint16_t testNumber = 1;
+    String filename;
+    String prefix = "MOD"; // Only modulus tests now
+    
+    do {
+        filename = prefix + String(testNumber, DEC) + ".CSV";
+        testNumber++;
+        if (testNumber > 999) testNumber = 1;
+    } while (SD.exists("/" + filename) && testNumber != 1);
+    
+    return filename;
+}
+
+bool startCSVLogging() {
+    if (!liveData.sdCardAvailable) {
+        Serial.println("CSV logging failed: SD card not available");
+        return false;
+    }
+    
+    currentTestFilename = generateTestFilename();
+    
+    // Create CSV file with test summary header
+    csvFile = SD.open("/" + currentTestFilename, FILE_WRITE);
+    
+    if (!csvFile) {
+        Serial.printf("CSV logging failed: Could not create file %s\n", currentTestFilename.c_str());
+        return false;
+    }
+    
+    // Write comprehensive header with test info
+    csvFile.println("# UTM Test Data - Real-time Stream");
+    csvFile.println("# Test Type: " + String(getTestModeString(currentTestMode)));
+    csvFile.println("# Test Rate: " + String(testRateOptions_mmpm[testRateIndex], 1) + " mm/min");
+    csvFile.println("# Start Time: " + String(millis()) + " ms");
+    csvFile.println("# Data Format: Timestamp_us,Force_N,Position_mm,Step_Count");
+    csvFile.println("# Note: Force values are absolute (always positive)");
+    csvFile.println("#");
+    csvFile.println("Timestamp_us,Force_N,Position_mm,Step_Count");
+    csvFile.flush();
+    
+    // Verify the file was created properly
+    if (csvFile.size() == 0) {
+        Serial.println("CSV logging failed: File created but no data written");
+        csvFile.close();
+        return false;
+    }
+    
+    csvLoggingActive = true;
+    Serial.printf("CSV real-time logging started: %s\n", currentTestFilename.c_str());
+    return true;
+}
+
+void logDataPointToCSV(const TestDataPoint& point) {
+    if (!csvLoggingActive || !csvFile) return;
+    
+    // Write data point to SD card
+    size_t bytesWritten = csvFile.printf("%llu,%.3f,%.3f,%lu\n", 
+                                        point.timestamp_us, point.force_N, 
+                                        point.position_mm, point.step_count);
+    
+    // Check if write was successful
+    if (bytesWritten == 0) {
+        Serial.println("CSV write failed - stopping CSV logging");
+        csvLoggingActive = false;
+        csvFile.close();
+        return;
+    }
+    
+    // Flush every SD_WRITE_INTERVAL points for better performance vs reliability balance
+    static uint16_t flushCounter = 0;
+    flushCounter++;
+    if (flushCounter >= SD_WRITE_INTERVAL) {
+        csvFile.flush();
+        flushCounter = 0;
+        
+        // Verify file is still accessible
+        if (!csvFile) {
+            Serial.println("CSV file lost - stopping CSV logging");
+            csvLoggingActive = false;
+        }
+    }
+}
+
+void stopCSVLogging() {
+    if (!csvLoggingActive) return;
+    
+    if (csvFile) {
+        // FIXED: More reliable CSV file closure with multiple flush attempts
+        csvFile.flush();
+        delay(10); // Give SD card time to complete write
+        csvFile.flush(); // Second flush for safety
+        
+        size_t finalSize = csvFile.size();
+        csvFile.close();
+        
+        Serial.printf("CSV logging stopped successfully. File: %s (%.1f KB)\n", 
+                     currentTestFilename.c_str(), finalSize / 1024.0f);
+        
+        // Verify file was saved properly
+        File testFile = SD.open("/" + currentTestFilename, FILE_READ);
+        if (testFile) {
+            if (testFile.size() == finalSize && testFile.size() > 50) {
+                Serial.println("CSV file verified successfully");
+            } else {
+                Serial.printf("WARNING: CSV file size mismatch or too small (%lu bytes)\n", testFile.size());
+            }
+            testFile.close();
+        } else {
+            Serial.println("ERROR: Could not verify CSV file after writing");
+        }
+    }
+    
+    csvLoggingActive = false;
+}
+
+// ===== HARDWARE TIMER INTERRUPT - FIXED =====
+void IRAM_ATTR stepTimerCallback() {
+    portENTER_CRITICAL_ISR(&timerMux);
+    if (moveStepper && motorEnabled) {
+        stepState = !stepState;
+        if (stepState)
+            REG_WRITE(GPIO_OUT_W1TS_REG, (1 << STEP));
+        else
+            REG_WRITE(GPIO_OUT_W1TC_REG, (1 << STEP));
+
+        if (stepState) {
+            stepsTaken++;
+            jogStepCounter += (stepperDir ? 1 : -1);
+            
+            // FIXED: Improved jog auto-stop with immediate state reset
+            if (jogActive) {
+                jogCurrentSteps++;
+                if (jogCurrentSteps >= jogTargetSteps) {
+                    moveStepper = false; // Stop immediately
+                    jogActive = false;
+                    // Note: State will be reset in main task to avoid ISR complications
+                }
+            }
+            
+            if (stepsTaken >= MOTOR_STEPS_PER_REV) {
+                stepsTaken = 0;
+                totalRotations++;
+                if (totalRotations > 30000) totalRotations = 0;
+            }
+        }
+    }
+    portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+// ===== TIMER FUNCTIONS =====
+void startStepTimer(uint32_t sps) {
+    if (sps == 0) {
+        stopStepTimer();
+        return;
+    }
+    
+    if (stepTimer) {
+        timerEnd(stepTimer);
+        stepTimer = NULL;
+        delay(10);
+    }
+    
+    if (sps < 10) sps = 10;
+    if (sps > 10000) sps = 10000;
+    
+    stepTimer = timerBegin(1000000);
+    if (!stepTimer) return;
+    
+    uint64_t alarmValue = 500000 / sps;
+    if (alarmValue < 50) alarmValue = 50;
+    
+    timerAttachInterrupt(stepTimer, &stepTimerCallback);
+    timerAlarm(stepTimer, alarmValue, true, 0);
+    timerRunning = true;
+}
+
+void stopStepTimer() {
+    if (stepTimer) {
+        timerEnd(stepTimer);
+        stepTimer = NULL;
+    }
+    REG_WRITE(GPIO_OUT_W1TC_REG, (1 << STEP));
+    stepState = false;
+    timerRunning = false;
+}
+
+// ===== MOTION CONTROL - FIXED =====
+void startJog(float rate_mmps) {
+    uint32_t sps = rate_mmps / MM_PER_STEP;
+    if (sps < 10) sps = 10;
+    if (sps > 10000) sps = 10000;
+    
+    stepperSpeed = sps;
+    digitalWrite(DIR, stepperDir);
+    startStepTimer(sps);
+}
+
+void jogDistance(float distance_mm, bool direction) {
+    if (currentState == STATE_TEST) {
+        Serial.println("Cannot jog during test");
+        return;
+    }
+    
+    if (distance_mm <= 0 || distance_mm > 50) {
+        Serial.println("Invalid jog distance");
+        return;
+    }
+    
+    // FIXED: Only stop if jog is actually active, not just if moveStepper is true
+    if (jogActive) {
+        Serial.println("Stopping previous jog...");
+        stopJog();
+        delay(50); // Give time for stop to complete
+    }
+    
+    currentState = STATE_JOG;
+    stepperDir = direction; // true = away from fixed jaw
+    
+    // FIXED: Calculate steps needed and reset counters
+    jogTargetSteps = (uint32_t)(distance_mm / MM_PER_STEP);
+    jogCurrentSteps = 0; // Reset the step counter
+    jogActive = true;
+    
+    moveStepper = true;
+    startJog(jogRateOptions_mmps[jogRateIndex]);
+    
+    Serial.printf("Jogging %.2fmm %s at %.1fmm/s (%lu steps, MM_PER_STEP=%.6f)\n", 
+                  distance_mm, direction ? "away" : "toward", 
+                  jogRateOptions_mmps[jogRateIndex], jogTargetSteps, MM_PER_STEP);
+}
+
+void stopJog() {
+    moveStepper = false;
+    jogActive = false;
+    stopStepTimer();
+    if (currentState == STATE_JOG) {
+        currentState = STATE_WIFI_ACTIVE; // Return to WiFi state
+    }
+    Serial.println("Jog stopped");
+}
+
+// ===== TEST CONTROL =====
+void startTest() {
+    Serial.println("Starting test...");
+    
+    // Perform test tare
+    Serial.println("Performing test tare...");
+    int32_t total = 0;
+    int validReadings = 0;
+    
+    for (int i = 0; i < 32; i++) {
+        delay(25);
+        if (myScale.available()) {
+            int32_t reading = myScale.getReading();
+            total += reading;
+            validReadings++;
+        }
+    }
+    
+    if (validReadings > 16) {
+        int32_t newZeroOffset = total / validReadings;
+        myScale.setZeroOffset(newZeroOffset);
+        Serial.printf("Test tare complete: %ld\n", newZeroOffset);
+    }
+    
+    // FIXED: Start real-time CSV logging for ALL test types
+    Serial.println("Starting real-time CSV logging...");
+    if (!startCSVLogging()) {
+        Serial.println("WARNING: CSV logging failed - test will continue with memory buffer only");
+        Serial.println("Check SD card connection for full data logging");
+    } else {
+        Serial.printf("Real-time CSV logging active: %s\n", currentTestFilename.c_str());
+    }
+    
+    // Reset position tracking
+    liveData.testStartPosition_mm = jogStepCounter * MM_PER_STEP;
+    
+    // Initialize test data
+    liveData.testActive = true;
+    liveData.testStartTime_us = esp_timer_get_time();
+    liveData.testEndTime_us = 0;
+    liveData.peakForce_N = 0.0f;
+    liveData.peakForcePosition_mm = 0.0f;
+    liveData.peakForceTime_us = 0;
+    liveData.breakPosition_mm = 0.0f;
+    liveData.breakForce_N = 0.0f;
+    liveData.breakTime_us = 0;
+    liveData.forceDropCounter = 0;
+    liveData.bufferOverflow = false;
+    liveData.sensorSaturated = false;
+    liveData.breakDetected = false;
+    liveData.peakDataIndex = 0;
+    liveData.lowForceCounter = 0;  // ENHANCED: Initialize low force counter
+    liveData.testHasReachedThreshold = false; // ENHANCED: Initialize threshold flag
+    bufferWriteIndex = 0;
+    bufferWrapped = false;
+    totalDataPoints = 0;
+    
+    // Start test motion
+    stepperDir = true; // IMPORTANT: away from fixed jaw (tensile). Set to false if your setup needs opposite direction
+    moveStepper = true;
+    float testRate_mmps = getCurrentTestRate_mmps();
+    startJog(testRate_mmps);
+    
+    currentState = STATE_TEST;
+    xEventGroupSetBits(testEventFlags, EVT_TEST_START);
+    
+    Serial.printf("Test started: %s mode at %.1f mm/min (auto-end when force < %.0fN for %.1fs after reaching %.0fN)\n", 
+                  getTestModeString(currentTestMode), testRateOptions_mmpm[testRateIndex],
+                  LOW_FORCE_THRESHOLD, LOW_FORCE_TIMEOUT_MS / 1000.0f, TEST_FORCE_THRESHOLD);
+}
+
+void stopTest() {
+    liveData.testEndTime_us = esp_timer_get_time();
+    liveData.testActive = false;
+    moveStepper = false;
+    stopStepTimer();
+    
+    // Record break data if not already detected
+    if (!liveData.breakDetected) {
+        liveData.breakPosition_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+        liveData.breakForce_N = liveData.currentForce_N;
+        liveData.breakTime_us = esp_timer_get_time();
+        liveData.breakDetected = true;
+    }
+    
+    // Stop CSV logging and finalize file with summary
+    if (csvLoggingActive) {
+        // Write test summary to end of file
+        float testDuration_s = (float)(liveData.testEndTime_us - liveData.testStartTime_us) / 1000000.0f;
+        csvFile.println("#");
+        csvFile.println("# Test Completed");
+        csvFile.println("# Final Results:");
+        csvFile.println("# Max Force: " + String(liveData.peakForce_N, 3) + " N");
+        csvFile.println("# Elongation at Max Force: " + String(liveData.peakForcePosition_mm, 3) + " mm");
+        csvFile.println("# Test Duration: " + String(testDuration_s, 1) + " s");
+        csvFile.println("# Total Data Points: " + String(totalDataPoints));
+        csvFile.println("# Break Force: " + String(liveData.breakForce_N, 3) + " N");
+        csvFile.println("# Break Position: " + String(liveData.breakPosition_mm, 3) + " mm");
+        
+        stopCSVLogging();
+    }
+    
+    float testDuration_s = (float)(liveData.testEndTime_us - liveData.testStartTime_us) / 1000000.0f;
+    
+    Serial.printf("TEST COMPLETED - Duration: %.1fs, Data points: %lu (full dataset on SD card)\n", testDuration_s, totalDataPoints);
+    Serial.printf("Peak: %.2fN at %.3fmm\n", liveData.peakForce_N, liveData.peakForcePosition_mm);
+    Serial.printf("Break: %.2fN at %.3fmm\n", liveData.breakForce_N, liveData.breakPosition_mm);
+    Serial.printf("SD Card File: %s\n", currentTestFilename.c_str());
+    
+    currentState = STATE_WIFI_ACTIVE;
+    xEventGroupSetBits(testEventFlags, EVT_TEST_STOP);
+}
+
+// ===== DATA ACQUISITION =====
+void recordDataPoint() {
+    if (!liveData.testActive) return;
+    
+    // Check buffer overflow - but continue test since we're streaming to SD
+    if (totalDataPoints >= BUFFER_SIZE && !bufferWrapped) {
+        Serial.println("Buffer full - now using circular buffer (data still streaming to SD)");
+        bufferWrapped = true;
+    }
+    
+    TestDataPoint& point = dataBuffer[bufferWriteIndex];
+    point.timestamp_us = esp_timer_get_time() - liveData.testStartTime_us;
+    point.force_N = liveData.currentForce_N;
+    point.position_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+    point.step_count = getStepsTakenSafe();
+    point.valid = true;
+    
+    // FIXED: Stream ALL test data to SD card in real-time (both test types)
+    if (csvLoggingActive) {
+        logDataPointToCSV(point);
+    }
+    
+    // Use circular buffer to keep recent data in memory for real-time display
+    bufferWriteIndex = (bufferWriteIndex + 1) % BUFFER_SIZE;
+    
+    totalDataPoints++;
+    xEventGroupSetBits(testEventFlags, EVT_DATA_READY);
+}
+
+// ===== WEB INTERFACE - RED THEME WITH FIXES =====
+const char* getWebInterface() {
+    return R"===(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>UTM Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            --bg-primary: #0F0A0A;
+            --bg-secondary: #1A0F0F;
+            --bg-tertiary: #2A1A1A;
+            --bg-quaternary: #3A2525;
+            --text-primary: #F5F5F5;
+            --text-secondary: #D0D0D0;
+            --text-muted: #888888;
+            --accent-primary: #DC2626;
+            --accent-secondary: #B91C1C;
+            --accent-success: #16A34A;
+            --accent-warning: #D97706;
+            --accent-danger: #EF4444;
+            --border: #3A2525;
+            --border-muted: #2A1A1A;
+            --shadow: rgba(0,0,0,0.8);
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+            overflow-x: hidden;
+        }
+        
+        .app-container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(10px);
+        }
+        
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-success);
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(0.95); }
+        }
+        
+        .main-content {
+            flex: 1;
+            padding: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        
+        .nav-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            background: var(--bg-secondary);
+            padding: 4px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        
+        .nav-tab {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 10px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        
+        .nav-tab.active {
+            background: var(--accent-primary);
+            color: white;
+            box-shadow: 0 2px 8px rgba(220,38,38,0.3);
+        }
+        
+        .nav-tab:hover:not(.active) {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .grid {
+            display: grid;
+            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        }
+        
+        /* FIXED: Force and Position side by side always, even on mobile */
+        .readings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 8px var(--shadow);
+        }
+        
+        .compact-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 2px 8px var(--shadow);
+            text-align: center;
+        }
+        
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        
+        .compact-title {
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        
+        .compact-value {
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+        }
+        
+        .compact-unit {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+        
+        .metric-card {
+            text-align: center;
+            padding: 24px;
+        }
+        
+        .metric-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+            margin-bottom: 4px;
+        }
+        
+        .metric-unit {
+            font-size: 1rem;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+        
+        .metric-label {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+        
+        .btn {
+            background: var(--accent-primary);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            text-decoration: none;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        
+        .btn:hover {
+            background: var(--accent-secondary);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(220,38,38,0.4);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn-danger {
+            background: var(--accent-danger);
+        }
+        
+        .btn-danger:hover {
+            background: #dc2626;
+            box-shadow: 0 4px 12px rgba(239,68,68,0.4);
+        }
+        
+        .btn-success {
+            background: var(--accent-success);
+        }
+        
+        .btn-success:hover {
+            background: #15803d;
+            box-shadow: 0 4px 12px rgba(22,163,74,0.4);
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--bg-quaternary);
+            box-shadow: 0 4px 12px rgba(58,37,37,0.4);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn:disabled:hover {
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .form-group {
+            margin-bottom: 16px;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 6px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        
+        .form-control {
+            width: 100%;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+        
+        .form-control:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(220,38,38,0.1);
+        }
+        
+        .control-row {
+            display: flex;
+            gap: 12px;
+            align-items: end;
+            flex-wrap: wrap;
+        }
+        
+        .control-row .form-group {
+            flex: 1;
+            margin-bottom: 0;
+            min-width: 120px;
+        }
+        
+        /* Manual Control Grid Layout */
+        .manual-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        
+        .manual-controls {
+            display: grid;
+            grid-template-rows: auto auto;
+            gap: 16px;
+        }
+        
+        .manual-buttons {
+            display: grid;
+            grid-template-rows: 1fr 1fr;
+            gap: 12px;
+        }
+        
+        .button-row {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .stop-button {
+            grid-column: 1 / -1;
+            margin-top: 8px;
+        }
+        
+        .test-progress {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            border: 1px solid var(--accent-primary);
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: var(--bg-quaternary);
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 12px 0;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-success));
+            width: 0%;
+            transition: width 0.3s ease;
+            border-radius: 3px;
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+        
+        .status-icon {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .status-icon.ready {
+            background: var(--accent-success);
+        }
+        
+        .status-icon.error {
+            background: var(--accent-danger);
+        }
+        
+        .status-icon.warning {
+            background: var(--accent-warning);
+        }
+        
+        .file-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 8px;
+            background: var(--bg-tertiary);
+        }
+        
+        .file-info {
+            flex: 1;
+        }
+        
+        .file-name {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        
+        .file-size {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        
+        .file-actions {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+        
+        .cal-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        
+        .cal-info {
+            background: var(--bg-tertiary);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+        
+        .cal-value {
+            font-family: monospace;
+            font-size: 1.1rem;
+            color: var(--accent-primary);
+            margin-top: 4px;
+        }
+        
+        .measure-result {
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            padding: 16px;
+            margin-top: 16px;
+            border: 1px solid var(--border);
+        }
+        
+        /* ENHANCED: Compact test results grid - now includes current force */
+        .results-compact-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        
+        .result-compact {
+            text-align: center;
+            padding: 12px;
+            background: var(--bg-secondary);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+        
+        .result-compact-value {
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: var(--accent-success);
+            margin-bottom: 4px;
+        }
+        
+        .result-compact-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        /* ENHANCED: Special styling for current force during testing */
+        .result-compact.current-force .result-compact-value {
+            color: var(--accent-primary);
+            animation: pulse-force 1.5s infinite;
+        }
+        
+        @keyframes pulse-force {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.8; transform: scale(0.98); }
+        }
+        
+        .test-results {
+            background: var(--bg-tertiary);
+            border: 2px solid var(--accent-success);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        /* Mobile optimizations */
+        @media (max-width: 768px) {
+            .main-content {
+                padding: 12px;
+            }
+            
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            
+            /* KEEP readings side by side on mobile */
+            .readings-grid {
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+            }
+            
+            .compact-title {
+                font-size: 0.75rem;
+            }
+            
+            .compact-value {
+                font-size: 1.4rem;
+            }
+            
+            .compact-unit {
+                font-size: 0.8rem;
+            }
+            
+            .manual-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .control-row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .control-row .form-group {
+                min-width: auto;
+            }
+            
+            .metric-value {
+                font-size: 2rem;
+            }
+            
+            .cal-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .results-compact-grid {
+                grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            }
+            
+            /* Better mobile button sizes */
+            .btn {
+                min-height: 44px;
+                padding: 12px 16px;
+            }
+            
+            .file-actions .btn {
+                min-height: 36px;
+                padding: 8px 12px;
+                font-size: 0.8rem;
+            }
+        }
+        
+        /* Extra small mobile screens */
+        @media (max-width: 480px) {
+            .compact-value {
+                font-size: 1.2rem;
+            }
+            
+            .compact-title {
+                font-size: 0.7rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <div class="header">
+            <h1>UTM Controller</h1>
+            <div class="status-badge">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Connected</span>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="nav-tabs">
+                <button class="nav-tab active" onclick="showTab('dashboard')">Dashboard</button>
+                <button class="nav-tab" onclick="showTab('test')" id="testTab">Test</button>
+                <button class="nav-tab" onclick="showTab('files')">Files</button>
+                <button class="nav-tab" onclick="showTab('setup')">Setup</button>
+            </div>
+
+            <!-- Dashboard Tab -->
+            <div id="dashboard" class="tab-content active">
+                <!-- Force and Position side by side ALWAYS -->
+                <div class="readings-grid">
+                    <div class="compact-card">
+                        <div class="compact-title">Current Force</div>
+                        <div class="compact-value" id="currentForce">0.0<span class="compact-unit">N</span></div>
+                    </div>
+                    <div class="compact-card">
+                        <div class="compact-title">Position</div>
+                        <div class="compact-value" id="currentPosition">0.000<span class="compact-unit">mm</span></div>
+                    </div>
+                </div>
+
+                <!-- Peak Force (only during test) -->
+                <div class="card metric-card hidden" id="peakForceCard">
+                    <div class="metric-value" id="peakForce">0.0</div>
+                    <div class="metric-unit">N</div>
+                    <div class="metric-label">Peak Force</div>
+                </div>
+
+                <!-- Manual Control - 4-box Grid Layout -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Manual Control</div>
+                    </div>
+                    <div class="manual-grid">
+                        <div class="manual-controls">
+                            <div class="form-group">
+                                <label class="form-label">Distance (mm)</label>
+                                <input type="number" class="form-control" id="jogDistance" value="1.0" step="0.1" min="0.1" max="50">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Speed</label>
+                                <select class="form-control" id="jogRate">
+                                    <option value="0">0.2 mm/s</option>
+                                    <option value="1" selected>0.4 mm/s</option>
+                                    <option value="2">0.8 mm/s</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="manual-buttons">
+                            <div class="button-row">
+                                <button type="button" class="btn btn-secondary" onclick="jogToward()" style="flex: 1;">Toward</button>
+                                <button type="button" class="btn btn-secondary" onclick="jogAway()" style="flex: 1;">Away</button>
+                            </div>
+                            <button type="button" class="btn btn-danger stop-button" onclick="stopJog()">Stop</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- System Status moved to bottom -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">System Status</div>
+                    </div>
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class="status-icon ready" id="loadCellIcon"></div>
+                            <span>Load Cell</span>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-icon ready" id="sdCardIcon"></div>
+                            <span>SD Card</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Compact Test Results (shown after test completion) -->
+                <div class="test-results hidden" id="testResults">
+                    <div class="card-header">
+                        <div class="card-title">Test Results</div>
+                    </div>
+                    <div class="results-compact-grid">
+                        <div class="result-compact">
+                            <div class="result-compact-value" id="resultMaxForce">0.0</div>
+                            <div class="result-compact-label">Max Force (N)</div>
+                        </div>
+                        <div class="result-compact">
+                            <div class="result-compact-value" id="resultElongation">0.0</div>
+                            <div class="result-compact-label">Elongation (mm)</div>
+                        </div>
+                        <div class="result-compact">
+                            <div class="result-compact-value" id="resultDuration">0.0</div>
+                            <div class="result-compact-label">Duration (s)</div>
+                        </div>
+                        <div class="result-compact">
+                            <div class="result-compact-value" id="resultDataPoints">0</div>
+                            <div class="result-compact-label">Data Points</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 16px;">
+                        <button type="button" class="btn btn-secondary" onclick="exportData()">Export Test Data</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Test Tab -->
+            <div id="test" class="tab-content">
+                <div class="grid">
+                    <!-- Test Configuration -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Test Configuration</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Test Type</label>
+                            <select class="form-control" id="testType">
+                                <option value="0">Modulus Test</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Test Rate</label>
+                            <select class="form-control" id="testRate">
+                                <option value="0">5 mm/min</option>
+                                <option value="1">1 mm/min</option>
+                            </select>
+                        </div>
+                        <button type="button" class="btn btn-success" id="startTestBtn" onclick="startTest()">Start Test</button>
+                        <button type="button" class="btn btn-danger hidden" id="stopTestBtn" onclick="stopTest()">Stop Test</button>
+                    </div>
+
+                    <!-- Test Progress (shown during test) -->
+                    <div class="test-progress hidden" id="testProgress">
+                        <div class="card-header">
+                            <div class="card-title">Test in Progress</div>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                        <!-- ENHANCED: Current Force now included with live display -->
+                        <div class="results-compact-grid">
+                            <div class="result-compact current-force">
+                                <div class="result-compact-value" id="testCurrentForce">0.0</div>
+                                <div class="result-compact-label">Current Force (N)</div>
+                            </div>
+                            <div class="result-compact">
+                                <div class="result-compact-value" id="testPeakForce">0.0</div>
+                                <div class="result-compact-label">Peak Force (N)</div>
+                            </div>
+                            <div class="result-compact">
+                                <div class="result-compact-value" id="testDuration">0.0</div>
+                                <div class="result-compact-label">Duration (s)</div>
+                            </div>
+                            <div class="result-compact">
+                                <div class="result-compact-value" id="testDataPoints">0</div>
+                                <div class="result-compact-label">Data Points</div>
+                            </div>
+                            <div class="result-compact">
+                                <div class="result-compact-value" id="testDistance">0.000</div>
+                                <div class="result-compact-label">Distance (mm)</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Files Tab -->
+            <div id="files" class="tab-content">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">Test Files</div>
+                        <button type="button" class="btn btn-secondary" onclick="refreshFiles()">Refresh</button>
+                    </div>
+                    <div class="file-list" id="fileList">
+                        <div style="text-align: center; padding: 40px; color: var(--text-muted);">
+                            Loading files...
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Setup Tab -->
+            <div id="setup" class="tab-content">
+                <div class="grid">
+                    <!-- Current Calibration -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Current Calibration</div>
+                            <button type="button" class="btn btn-secondary" onclick="refreshCalibration()">Refresh</button>
+                        </div>
+                        <div class="cal-grid">
+                            <div class="cal-info">
+                                <div class="form-label">Calibration Factor</div>
+                                <div class="cal-value" id="calFactor">Not Available</div>
+                            </div>
+                            <div class="cal-info">
+                                <div class="form-label">Zero Offset</div>
+                                <div class="cal-value" id="calOffset">Not Available</div>
+                            </div>
+                            <div class="cal-info">
+                                <div class="form-label">Current Gain</div>
+                                <div class="cal-value" id="calGain">Not Available</div>
+                            </div>
+                            <div class="cal-info">
+                                <div class="form-label">Status</div>
+                                <div class="cal-value" id="calStatus">Not Available</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Gain Setting -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Gain Setting</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">ADC Gain</label>
+                            <select class="form-control" id="gainSetting">
+                                <option value="1">1x</option>
+                                <option value="2">2x</option>
+                                <option value="4">4x</option>
+                                <option value="8">8x</option>
+                                <option value="16" selected>16x</option>
+                                <option value="32">32x</option>
+                                <option value="64">64x</option>
+                                <option value="128">128x</option>
+                            </select>
+                        </div>
+                        <button type="button" class="btn btn-secondary" onclick="setGain()">Set Gain</button>
+                    </div>
+                    
+                    <!-- Web Calibration -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Web Calibration</div>
+                        </div>
+                        <p style="color: var(--text-secondary); margin-bottom: 16px;">
+                            Step 1: Remove all weight and tare the scale
+                        </p>
+                        <button type="button" class="btn btn-secondary" onclick="webTare()" id="tareBtn">Tare Scale</button>
+                        
+                        <div class="form-group" style="margin-top: 20px;">
+                            <label class="form-label">Step 2: Apply known weight (kg)</label>
+                            <input type="number" class="form-control" id="knownWeight" value="1.0" step="0.1" min="0.1">
+                        </div>
+                        <button type="button" class="btn btn-secondary" onclick="webCalibrate()" id="calibrateBtn">Calibrate</button>
+                        
+                        <div class="measure-result hidden" id="calibrationResult">
+                            <div class="form-label">Calibration Result</div>
+                            <div id="calibrationOutput"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- Measurement Test -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">Measurement Test</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Number of Samples</label>
+                            <input type="number" class="form-control" id="measureSamples" value="50" min="10" max="200">
+                        </div>
+                        <button type="button" class="btn btn-secondary" onclick="measureTest()" id="measureBtn">Run Test</button>
+                        
+                        <div class="measure-result hidden" id="measureResult">
+                            <div class="form-label">Measurement Results</div>
+                            <div id="measureOutput"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- WiFi Information -->
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">WiFi Information</div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Network Name (SSID)</label>
+                            <input type="text" class="form-control" value="UTM-Controller" readonly>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Password</label>
+                            <input type="text" class="form-control" value="testing123" readonly>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let testActive = false;
+        let testStartTime = 0;
+        let connected = false;
+        let lastTestState = null; // null to detect initial state properly
+        let testJustCompleted = false;
+
+        function showTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.nav-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName).classList.add('active');
+            
+            // Find and activate the correct tab button
+            document.querySelectorAll('.nav-tab').forEach(tab => {
+                if (tab.textContent.toLowerCase().includes(tabName.toLowerCase())) {
+                    tab.classList.add('active');
+                }
+            });
+            
+            // Load files when files tab is opened
+            if (tabName === 'files') {
+                refreshFiles();
+            }
+            
+            // Refresh calibration when setup tab is opened
+            if (tabName === 'setup') {
+                refreshCalibration();
+            }
+        }
+
+        function updateConnectionStatus(status) {
+            connected = status;
+            document.getElementById('statusText').textContent = status ? 'Connected' : 'Disconnected';
+            document.getElementById('statusDot').style.background = status ? 'var(--accent-success)' : 'var(--accent-danger)';
+        }
+
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/data');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                console.log('Fetched data:', data); // Debug log
+                updateUI(data);
+                updateConnectionStatus(true);
+            } catch (error) {
+                console.error('Error fetching data:', error);
+                updateConnectionStatus(false);
+            }
+        }
+
+        function updateUI(data) {
+            console.log('updateUI called with testActive:', data.testActive, 'lastTestState:', lastTestState);
+            
+            // Update force readings
+            document.getElementById('currentForce').innerHTML = data.currentForce.toFixed(1) + '<span class="compact-unit">N</span>';
+            document.getElementById('currentPosition').innerHTML = data.currentPosition.toFixed(3) + '<span class="compact-unit">mm</span>';
+            
+            // Update system status icons
+            document.getElementById('loadCellIcon').className = 'status-icon ' + (data.loadCellReady ? 'ready' : 'error');
+            document.getElementById('sdCardIcon').className = 'status-icon ' + (data.sdCardReady ? 'ready' : 'error');
+            
+            // FIXED: More robust test state handling
+            if (lastTestState === null || data.testActive !== lastTestState) {
+                console.log('State change detected:', lastTestState, '->', data.testActive);
+                
+                if (data.testActive) {
+                    // Test is active (started or continuing)
+                    if (!testActive) {
+                        console.log('Starting test UI...');
+                        testActive = true;
+                        testStartTime = Date.now();
+                        testJustCompleted = false;
+                        
+                        document.getElementById('startTestBtn').classList.add('hidden');
+                        document.getElementById('stopTestBtn').classList.remove('hidden');
+                        document.getElementById('testProgress').classList.remove('hidden');
+                        document.getElementById('peakForceCard').classList.remove('hidden');
+                        document.getElementById('testResults').classList.add('hidden');
+                        
+                        showTab('test'); // Auto-switch to test tab
+                    }
+                } else {
+                    // Test is not active
+                    if (testActive) {
+                        console.log('Stopping test UI...');
+                        testActive = false;
+                        testJustCompleted = true;
+                        
+                        document.getElementById('startTestBtn').classList.remove('hidden');
+                        document.getElementById('stopTestBtn').classList.add('hidden');
+                        document.getElementById('testProgress').classList.add('hidden');
+                        document.getElementById('peakForceCard').classList.add('hidden');
+                        
+                        // Show results immediately when test stops
+                        showTestResults(data);
+                        console.log('Test stopped - showing results');
+                    }
+                }
+                lastTestState = data.testActive;
+            }
+            
+            // Update test data during test
+            if (testActive && data.testActive) {
+                const duration = (Date.now() - testStartTime) / 1000;
+                document.getElementById('testDuration').textContent = duration.toFixed(1);
+                document.getElementById('testDataPoints').textContent = data.dataPoints;
+                document.getElementById('testDistance').textContent = data.testDistance.toFixed(3);
+                document.getElementById('peakForce').textContent = data.peakForce.toFixed(1);
+                document.getElementById('testPeakForce').textContent = data.peakForce.toFixed(1);
+                
+                // ENHANCED: Update current force during test with live animation
+                document.getElementById('testCurrentForce').textContent = data.currentForce.toFixed(1);
+                
+                // FIXED: Update progress bar with 5000N max instead of 100N
+                const maxForce = 5000; // 5000N maximum
+                const progress = Math.min((Math.abs(data.currentForce) / maxForce) * 100, 100);
+                document.getElementById('progressFill').style.width = progress + '%';
+            }
+        }
+
+        function showTestResults(data) {
+            console.log('Showing test results with data:', data);
+            
+            const duration = (Date.now() - testStartTime) / 1000;
+            
+            // FIXED: Use position at peak force for elongation, removed duplicate max force
+            document.getElementById('resultMaxForce').textContent = data.peakForce.toFixed(1);
+            document.getElementById('resultElongation').textContent = data.peakForcePosition ? data.peakForcePosition.toFixed(3) : '0.000';
+            document.getElementById('resultDuration').textContent = duration.toFixed(1);
+            document.getElementById('resultDataPoints').textContent = data.dataPoints;
+            
+            document.getElementById('testResults').classList.remove('hidden');
+            
+            // Switch back to dashboard to show results
+            setTimeout(() => {
+                showTab('dashboard');
+            }, 1000);
+        }
+
+        async function sendCommand(command, params = {}) {
+            try {
+                const formData = new FormData();
+                formData.append('command', command);
+                
+                for (const [key, value] of Object.entries(params)) {
+                    formData.append(key, value);
+                }
+                
+                const response = await fetch('/api/command', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.text();
+                console.log('Command result:', result);
+                
+                if (!response.ok) {
+                    alert('Command failed: ' + result);
+                    return null;
+                }
+                
+                return result;
+            } catch (error) {
+                console.error('Error sending command:', error);
+                alert('Command failed: Network error');
+                return null;
+            }
+        }
+
+        async function startTest() {
+            console.log('startTest() called');
+            const testType = document.getElementById('testType').value;
+            const testRate = document.getElementById('testRate').value;
+            
+            const result = await sendCommand('startTest', {testType: testType, testRate: testRate});
+            
+            if (result && result.includes('started')) {
+                console.log('Test started successfully, forcing UI update...');
+                // Force immediate UI update
+                document.getElementById('startTestBtn').classList.add('hidden');
+                document.getElementById('stopTestBtn').classList.remove('hidden');
+                showTab('test');
+                
+                // Set a timeout to check if the backend confirms the test started
+                setTimeout(async () => {
+                    try {
+                        const response = await fetch('/api/data');
+                        const data = await response.json();
+                        if (data.testActive) {
+                            console.log('Backend confirms test is active');
+                        } else {
+                            console.log('Backend says test is not active, reverting UI');
+                            document.getElementById('startTestBtn').classList.remove('hidden');
+                            document.getElementById('stopTestBtn').classList.add('hidden');
+                        }
+                    } catch (error) {
+                        console.error('Error checking test status:', error);
+                    }
+                }, 1000);
+            }
+        }
+
+        async function stopTest() {
+            console.log('stopTest() called');
+            const result = await sendCommand('stopTest');
+            
+            if (result) {
+                console.log('Test stopped successfully, forcing UI update...');
+                // Force immediate UI update
+                document.getElementById('startTestBtn').classList.remove('hidden');
+                document.getElementById('stopTestBtn').classList.add('hidden');
+            }
+        }
+
+        function jogToward() {
+            const distance = parseFloat(document.getElementById('jogDistance').value);
+            const jogRate = document.getElementById('jogRate').value;
+            
+            if (isNaN(distance) || distance <= 0 || distance > 50) {
+                alert('Distance must be between 0.1 and 50 mm');
+                return;
+            }
+            
+            sendCommand('jog', {distance: distance.toFixed(2), direction: 'false', jogRate: jogRate});
+        }
+
+        function jogAway() {
+            const distance = parseFloat(document.getElementById('jogDistance').value);
+            const jogRate = document.getElementById('jogRate').value;
+            
+            if (isNaN(distance) || distance <= 0 || distance > 50) {
+                alert('Distance must be between 0.1 and 50 mm');
+                return;
+            }
+            
+            sendCommand('jog', {distance: distance.toFixed(2), direction: 'true', jogRate: jogRate});
+        }
+
+        function stopJog() {
+            sendCommand('stopJog');
+        }
+
+        function tare() {
+            sendCommand('tare');
+        }
+
+        function exportData() {
+            window.open('/export', '_blank');
+        }
+
+        async function refreshFiles() {
+            try {
+                const response = await fetch('/api/files');
+                const data = await response.json();
+                displayFiles(data.files);
+            } catch (error) {
+                console.error('Error fetching files:', error);
+                document.getElementById('fileList').innerHTML = 
+                    '<div style="text-align: center; padding: 40px; color: var(--accent-danger);">Error loading files</div>';
+            }
+        }
+
+        function displayFiles(files) {
+            const fileList = document.getElementById('fileList');
+            
+            if (files.length === 0) {
+                fileList.innerHTML = 
+                    '<div style="text-align: center; padding: 40px; color: var(--text-muted);">No files found</div>';
+                return;
+            }
+            
+            fileList.innerHTML = files.map(file => `
+                <div class="file-item">
+                    <div class="file-info">
+                        <div class="file-name">${file.name}</div>
+                        <div class="file-size">${formatFileSize(file.size)}</div>
+                    </div>
+                    <div class="file-actions">
+                        <button type="button" class="btn btn-secondary" onclick="downloadFile('${file.name}')">Download</button>
+                        <button type="button" class="btn btn-danger" onclick="confirmDeleteFile('${file.name}')" data-filename="${file.name}">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function downloadFile(filename) {
+            window.open('/download?file=' + encodeURIComponent(filename), '_blank');
+        }
+
+        // FIXED: Remove confirmation dialog - direct delete for mobile compatibility
+        async function confirmDeleteFile(filename) {
+            console.log('Deleting file directly:', filename);
+            
+            try {
+                const result = await sendCommand('deleteFile', {filename: filename});
+                console.log('Delete result:', result);
+                
+                if (result && (result.includes('deleted') || result.includes('successfully'))) {
+                    await refreshFiles(); // Refresh the file list
+                } else {
+                    alert('Failed to delete file: ' + result);
+                }
+            } catch (error) {
+                console.error('Delete error:', error);
+                alert('Error deleting file: ' + error.message);
+            }
+        }
+
+        async function refreshCalibration() {
+            try {
+                const response = await fetch('/api/calibration');
+                const data = await response.json();
+                
+                document.getElementById('calFactor').textContent = data.factor;
+                document.getElementById('calOffset').textContent = data.offset;
+                document.getElementById('calGain').textContent = data.gain + 'x';
+                document.getElementById('calStatus').textContent = data.calibrated ? 'Calibrated' : 'Not Calibrated';
+                document.getElementById('gainSetting').value = data.gain;
+            } catch (error) {
+                console.error('Error fetching calibration:', error);
+            }
+        }
+
+        async function setGain() {
+            const gain = document.getElementById('gainSetting').value;
+            const result = await sendCommand('setGain', {gain: gain});
+            if (result) {
+                alert('Gain set to ' + gain + 'x');
+                refreshCalibration();
+            }
+        }
+
+        async function webTare() {
+            document.getElementById('tareBtn').disabled = true;
+            document.getElementById('tareBtn').textContent = 'Taring...';
+            
+            const result = await sendCommand('webTare');
+            
+            document.getElementById('tareBtn').disabled = false;
+            document.getElementById('tareBtn').textContent = 'Tare Scale';
+            
+            if (result) {
+                alert('Tare completed: ' + result);
+                refreshCalibration();
+            }
+        }
+
+        async function webCalibrate() {
+            const weight = parseFloat(document.getElementById('knownWeight').value);
+            if (isNaN(weight) || weight <= 0) {
+                alert('Please enter a valid weight');
+                return;
+            }
+            
+            document.getElementById('calibrateBtn').disabled = true;
+            document.getElementById('calibrateBtn').textContent = 'Calibrating...';
+            
+            const result = await sendCommand('webCalibrate', {weight: weight});
+            
+            document.getElementById('calibrateBtn').disabled = false;
+            document.getElementById('calibrateBtn').textContent = 'Calibrate';
+            
+            if (result) {
+                document.getElementById('calibrationResult').classList.remove('hidden');
+                document.getElementById('calibrationOutput').textContent = result;
+                refreshCalibration();
+                alert('Calibration completed: ' + result);
+            }
+        }
+
+        async function measureTest() {
+            const samples = parseInt(document.getElementById('measureSamples').value);
+            if (isNaN(samples) || samples < 10 || samples > 200) {
+                alert('Please enter 10-200 samples');
+                return;
+            }
+            
+            document.getElementById('measureBtn').disabled = true;
+            document.getElementById('measureBtn').textContent = 'Testing...';
+            
+            const result = await sendCommand('measureTest', {samples: samples});
+            
+            document.getElementById('measureBtn').disabled = false;
+            document.getElementById('measureBtn').textContent = 'Run Test';
+            
+            if (result) {
+                document.getElementById('measureResult').classList.remove('hidden');
+                document.getElementById('measureOutput').innerHTML = result.replace(/\\n/g, '<br>');
+            }
+        }
+
+        // Start polling for data
+        setInterval(fetchData, 500);
+        fetchData();
+        
+        // Load files on startup
+        refreshFiles();
+    </script>
+</body>
+</html>
+)===";
+}
+
+// ===== WEB API HANDLERS =====
+void handleGetData() {
+    String json = "{";
+    json += "\"currentForce\":" + String(liveData.currentForce_N, 3) + ",";
+    json += "\"peakForce\":" + String(liveData.peakForce_N, 3) + ",";
+    json += "\"peakForcePosition\":" + String(liveData.peakForcePosition_mm, 3) + ",";
+    json += "\"currentPosition\":" + String(liveData.currentPosition_mm, 3) + ",";
+    json += "\"testDistance\":" + String(liveData.currentPosition_mm - liveData.testStartPosition_mm, 3) + ",";
+    json += "\"loadCellReady\":" + String(liveData.scaleCalibrated ? "true" : "false") + ",";
+    json += "\"sdCardReady\":" + String(liveData.sdCardAvailable ? "true" : "false") + ",";
+    json += "\"testActive\":" + String(liveData.testActive ? "true" : "false") + ",";
+    json += "\"dataPoints\":" + String(totalDataPoints) + ",";
+    json += "\"csvLogging\":" + String(csvLoggingActive ? "true" : "false") + ",";
+    json += "\"systemState\":\"" + String(currentState) + "\"";
+    json += "}";
+    
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+void handleCalibration() {
+    String json = "{";
+    json += "\"calibrated\":" + String(liveData.scaleCalibrated ? "true" : "false") + ",";
+    json += "\"factor\":\"" + String(liveData.scaleCalibrated ? myScale.getCalibrationFactor() : 0.0f, 8) + "\",";
+    json += "\"offset\":\"" + String(liveData.scaleCalibrated ? myScale.getZeroOffset() : 0) + "\",";
+    json += "\"gain\":" + String(currentGainSetting);
+    json += "}";
+    
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+void handleCommand() {
+    if (server.method() != HTTP_POST) {
+        server.send(405, "text/plain", "Method not allowed");
+        return;
+    }
+    
+    String command = server.arg("command");
+    String response = "OK";
+    
+    Serial.printf("Received command: %s\n", command.c_str());
+    Serial.printf("Current state: %d\n", currentState);
+    
+    if (command == "startTest") {
+        if (currentState == STATE_IDLE || currentState == STATE_WIFI_ACTIVE) {
+            currentTestMode = (TestMode)server.arg("testType").toInt();
+            testRateIndex = server.arg("testRate").toInt();
+            Serial.printf("Starting test: mode=%d, rate=%d\n", currentTestMode, testRateIndex);
+            startTest();
+            response = "Test started";
+        } else {
+            response = "Cannot start test - system busy (state: " + String(currentState) + ")";
+        }
+    }
+    else if (command == "stopTest" || command == "emergencyStop") {
+        if (currentState == STATE_TEST) {
+            stopTest();
+            response = "Test stopped";
+        }
+        else if (currentState == STATE_JOG) {
+            stopJog();
+            response = "Jog stopped";
+        }
+        else {
+            moveStepper = false;
+            jogActive = false;
+            stopStepTimer();
+            currentState = STATE_WIFI_ACTIVE;
+            response = "Emergency stop executed";
+        }
+    }
+    else if (command == "jog") {
+        if (currentState == STATE_IDLE || currentState == STATE_WIFI_ACTIVE) {
+            float distance = server.arg("distance").toFloat();
+            bool direction = server.arg("direction") == "true";
+            int newJogRate = server.arg("jogRate").toInt();
+            
+            // Validate jog rate
+            if (newJogRate >= 0 && newJogRate < 3) {
+                jogRateIndex = newJogRate;
+            }
+            
+            Serial.printf("Jogging: %.2fmm, dir=%s, rate=%.1fmm/s\n", 
+                         distance, direction ? "away" : "toward", jogRateOptions_mmps[jogRateIndex]);
+            
+            jogDistance(distance, direction);
+            response = "Jog started: " + String(distance) + "mm " + (direction ? "away" : "toward");
+        } else {
+            Serial.printf("Jog blocked - current state: %d (jogActive: %s, moveStepper: %s)\n", 
+                         currentState, jogActive ? "true" : "false", moveStepper ? "true" : "false");
+            response = "Cannot jog - system busy (state: " + String(currentState) + ")";
+        }
+    }
+    else if (command == "stopJog") {
+        stopJog();
+        response = "Jog stopped";
+    }
+    else if (command == "tare") {
+        xEventGroupSetBits(testEventFlags, EVT_TARE_REQUEST);
+        response = "Tare requested";
+    }
+    else if (command == "setGain") {
+        int gain = server.arg("gain").toInt();
+        
+        bool gainSet = false;
+        switch (gain) {
+            case 1: gainSet = myScale.setGain(NAU7802_GAIN_1); break;
+            case 2: gainSet = myScale.setGain(NAU7802_GAIN_2); break;
+            case 4: gainSet = myScale.setGain(NAU7802_GAIN_4); break;
+            case 8: gainSet = myScale.setGain(NAU7802_GAIN_8); break;
+            case 16: gainSet = myScale.setGain(NAU7802_GAIN_16); break;
+            case 32: gainSet = myScale.setGain(NAU7802_GAIN_32); break;
+            case 64: gainSet = myScale.setGain(NAU7802_GAIN_64); break;
+            case 128: gainSet = myScale.setGain(NAU7802_GAIN_128); break;
+            default:
+                response = "Invalid gain. Valid: 1,2,4,8,16,32,64,128";
+                break;
+        }
+        
+        if (gainSet) {
+            currentGainSetting = gain;
+            EEPROM.put(LOCATION_GAIN_SETTING, currentGainSetting);
+            EEPROM.commit();
+            myScale.calibrateAFE();
+            response = "Gain set to " + String(gain) + "x";
+        } else if (response == "OK") {
+            response = "Failed to set gain";
+        }
+    }
+    else if (command == "webTare") {
+        if (loadCellAvailable) {
+            // Enhanced tare for web interface - longer delays and more samples
+            int32_t total = 0;
+            int validReadings = 0;
+            int attempts = 0;
+            const int maxAttempts = 100;
+            
+            while (validReadings < 24 && attempts < maxAttempts) {
+                delay(100); // Longer delay for stability
+                attempts++;
+                
+                uint32_t startWait = millis();
+                while (!myScale.available() && (millis() - startWait < 100)) {
+                    delay(2);
+                }
+                
+                if (myScale.available()) {
+                    int32_t reading = myScale.getReading();
+                    if (abs(reading) < 16000000) {
+                        total += reading;
+                        validReadings++;
+                    }
+                }
+            }
+            
+            if (validReadings > 12) {
+                int32_t newZeroOffset = total / validReadings;
+                myScale.setZeroOffset(newZeroOffset);
+                saveCalibration();
+                response = "Tare complete: " + String(newZeroOffset) + " (from " + String(validReadings) + " readings)";
+            } else {
+                response = "Tare failed - insufficient readings (" + String(validReadings) + "/" + String(maxAttempts) + " attempts)";
+            }
+        } else {
+            response = "Load cell not available";
+        }
+    }
+    else if (command == "webCalibrate") {
+        if (loadCellAvailable) {
+            float knownWeight = server.arg("weight").toFloat();
+            if (knownWeight <= 0) {
+                response = "Invalid weight value";
+            } else {
+                // Enhanced calibration readings - longer delays and more samples
+                int32_t total = 0;
+                int validReadings = 0;
+                int attempts = 0;
+                const int maxAttempts = 100;
+                
+                while (validReadings < 24 && attempts < maxAttempts) {
+                    delay(100); // Longer delay for stability
+                    attempts++;
+                    
+                    uint32_t startWait = millis();
+                    while (!myScale.available() && (millis() - startWait < 100)) {
+                        delay(2);
+                    }
+                    
+                    if (myScale.available()) {
+                        int32_t reading = myScale.getReading();
+                        if (abs(reading) < 16000000) {
+                            total += reading;
+                            validReadings++;
+                        }
+                    }
+                }
+                
+                if (validReadings > 12) {
+                    float averageReading = (float)total / validReadings;
+                    int32_t zeroOffset = myScale.getZeroOffset();
+                    float calibrationFactor = -((averageReading - zeroOffset) / knownWeight);
+                    
+                    if (calibrationFactor != 0.0f && !isnan(calibrationFactor)) {
+                        myScale.setCalibrationFactor(calibrationFactor);
+                        saveCalibration();
+                        liveData.scaleCalibrated = true;
+                        response = "Calibration complete. Factor: " + String(calibrationFactor, 8) + " (from " + String(validReadings) + " readings)";
+                    } else {
+                        response = "Invalid calibration factor calculated";
+                    }
+                } else {
+                    response = "Calibration failed - insufficient readings (" + String(validReadings) + "/" + String(maxAttempts) + " attempts)";
+                }
+            }
+        } else {
+            response = "Load cell not available";
+        }
+    }
+    else if (command == "measureTest") {
+        if (loadCellAvailable && liveData.scaleCalibrated) {
+            int samples = server.arg("samples").toInt();
+            if (samples < 10 || samples > 200) samples = 50;
+            
+            float total = 0;
+            int validSamples = 0;
+            int attempts = 0;
+            const int maxAttempts = samples * 3;
+            
+            while (validSamples < samples && attempts < maxAttempts) {
+                delay(50); // Longer delay for better readings
+                attempts++;
+                
+                uint32_t startWait = millis();
+                while (!myScale.available() && (millis() - startWait < 50)) {
+                    delay(1);
+                }
+                
+                if (myScale.available()) {
+                    float force = getForceN();
+                    if (!liveData.scaleError && !liveData.sensorSaturated) {
+                        total += force;
+                        validSamples++;
+                    }
+                }
+            }
+            
+            if (validSamples > 0) {
+                float average = total / validSamples;
+                float successRate = (validSamples * 100.0f) / samples;
+                response = "Average: " + String(average, 3) + " N (" + String(average / 9.81f, 3) + " kg)\\n";
+                response += "Valid samples: " + String(validSamples) + "/" + String(samples) + " (" + String(successRate, 1) + "%)\\n";
+                response += "Total attempts: " + String(attempts);
+                
+                if (successRate < 80) {
+                    response += "\\nWARNING: Low success rate - check connections";
+                }
+            } else {
+                response = "Test failed - no valid readings obtained\\nCheck NAU7802 connections and calibration";
+            }
+        } else {
+            response = "Load cell not available or not calibrated";
+        }
+    }
+    else if (command == "deleteFile") {
+        String filename = server.arg("filename");
+        if (filename == "") {
+            response = "No filename specified";
+        } else if (!liveData.sdCardAvailable) {
+            response = "SD card not available";
+        } else {
+            String fullPath = "/" + filename;
+            Serial.printf("Attempting to delete file: %s\n", fullPath.c_str());
+            
+            if (SD.remove(fullPath)) {
+                response = "File " + filename + " deleted successfully";
+                Serial.printf("File deleted: %s\n", filename.c_str());
+            } else {
+                response = "Failed to delete file " + filename;
+                Serial.printf("Failed to delete file: %s\n", filename.c_str());
+            }
+        }
+    }
+    else {
+        response = "Unknown command: " + command;
+    }
+    
+    Serial.printf("Command response: %s\n", response.c_str());
+    
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/plain", response);
+}
+
+void handleRoot() {
+    server.send(200, "text/html", getWebInterface());
+}
+
+void handleNotFound() {
+    // Captive portal - redirect everything to main page
+    if (server.hostHeader() != WiFi.softAPIP().toString()) {
+        String redirectURL = "http://" + WiFi.softAPIP().toString();
+        server.sendHeader("Location", redirectURL);
+        server.send(302, "text/plain", "");
+    } else {
+        server.send(200, "text/html", getWebInterface());
+    }
+}
+
+void handleCaptivePortalDetection() {
+    // Handle common captive portal detection URLs
+    server.send(200, "text/html", getWebInterface());
+}
+
+void handleExport() {
+    // Calculate test duration and summary stats
+    float testDuration_s = (float)(liveData.testEndTime_us - liveData.testStartTime_us) / 1000000.0f;
+    
+    String csv = "# UTM Test Results Summary\n";
+    csv += "# Test Type: " + String(getTestModeString(currentTestMode)) + "\n";
+    csv += "# Max Force: " + String(liveData.peakForce_N, 3) + " N\n";
+    csv += "# Elongation at Max Force: " + String(liveData.peakForcePosition_mm, 3) + " mm\n";
+    csv += "# Test Duration: " + String(testDuration_s, 1) + " s\n";
+    csv += "# Total Data Points: " + String(totalDataPoints) + "\n";
+    csv += "# Test Rate: " + String(testRateOptions_mmpm[testRateIndex], 1) + " mm/min\n";
+    csv += "# Note: Force values are absolute (always positive)\n";
+    csv += "#\n";
+    csv += "Timestamp_us,Force_N,Position_mm,Step_Count\n";
+    
+    // FIXED: Use full buffer size for all test types
+    uint16_t bufferSize = BUFFER_SIZE;
+    uint16_t startIndex = bufferWrapped ? bufferWriteIndex : 0;
+    uint16_t count = bufferWrapped ? bufferSize : bufferWriteIndex;
+    
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t index = (startIndex + i) % bufferSize;
+        TestDataPoint& point = dataBuffer[index];
+        
+        if (point.valid) {
+            csv += String(point.timestamp_us) + "," + 
+                   String(point.force_N, 3) + "," + 
+                   String(point.position_mm, 3) + "," + 
+                   String(point.step_count) + "\n";
+        }
+    }
+    
+    String filename = "test_data_" + String(getTestModeString(currentTestMode)) + ".csv";
+    server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+    server.send(200, "text/csv", csv);
+}
+
+void handleFileList() {
+    String json = "{\"files\":[";
+    
+    if (liveData.sdCardAvailable) {
+        File root = SD.open("/");
+        File file = root.openNextFile();
+        bool first = true;
+        
+        while (file) {
+            if (!file.isDirectory()) {
+                if (!first) json += ",";
+                json += "{\"name\":\"" + String(file.name()) + "\",\"size\":" + String(file.size()) + "}";
+                first = false;
+            }
+            file = root.openNextFile();
+        }
+    }
+    
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+void handleDownload() {
+    String filename = server.arg("file");
+    if (filename == "") {
+        server.send(400, "text/plain", "No file specified");
+        return;
+    }
+    
+    if (!liveData.sdCardAvailable) {
+        server.send(503, "text/plain", "SD card not available");
+        return;
+    }
+    
+    File file = SD.open("/" + filename);
+    if (!file) {
+        server.send(404, "text/plain", "File not found");
+        return;
+    }
+    
+    server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+    server.streamFile(file, "application/octet-stream");
+    file.close();
+}
+
+// ===== DATA ACQUISITION TASK =====
+void dataAcquisitionTask(void* pvParameters) {
+    Serial.println("Data acquisition task started");
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(12); // ~80Hz
+    
+    for (;;) {
+        // Update position
+        liveData.currentPosition_mm = jogStepCounter * MM_PER_STEP;
+        liveData.totalSteps = getStepsTakenSafe();
+        
+        // FIXED: More aggressive state reset for jog completion
+        if (!jogActive && !moveStepper && currentState == STATE_JOG) {
+            currentState = STATE_WIFI_ACTIVE;
+            Serial.printf("Jog state reset - ready for new commands (state: %d)\n", currentState);
+        }
+        
+        // FIXED: Also check for completed jog from timer interrupt
+        if (jogActive && !moveStepper) {
+            jogActive = false;
+            stopStepTimer(); // Ensure timer is properly stopped
+            
+            // CRITICAL FIX: Force state reset immediately
+            currentState = STATE_WIFI_ACTIVE;
+            Serial.printf("Jog completed automatically after %lu steps - state reset to %d\n", 
+                         jogCurrentSteps, currentState);
+        }
+        
+        // Read load cell
+        if (liveData.scaleCalibrated && loadCellAvailable) {
+            float newForce = getForceN();
+            if (newForce != 0.0f || !liveData.testActive) {
+                liveData.currentForce_N = newForce;
+            }
+        }
+        
+        // Record data during testing
+        if (liveData.testActive) {
+            recordDataPoint();
+            
+            // Peak tracking
+            if (liveData.currentForce_N > 10.0f) {
+                if (liveData.currentForce_N > liveData.peakForce_N) {
+                    liveData.peakForce_N = liveData.currentForce_N;
+                    liveData.peakForcePosition_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+                    liveData.peakForceTime_us = esp_timer_get_time();
+                    liveData.peakDataIndex = bufferWriteIndex; // Record peak index
+                    liveData.forceDropCounter = 0;
+                }
+            }
+            
+            // ENHANCED: Check if test has reached meaningful threshold
+            if (!liveData.testHasReachedThreshold && liveData.currentForce_N >= TEST_FORCE_THRESHOLD) {
+                liveData.testHasReachedThreshold = true;
+                Serial.printf("Test reached %.0fN threshold - auto-end logic now active\n", TEST_FORCE_THRESHOLD);
+            }
+            
+            // ENHANCED: New test end logic - only activate after reaching threshold
+            if (liveData.testHasReachedThreshold && liveData.currentForce_N <= LOW_FORCE_THRESHOLD) {
+                liveData.lowForceCounter++;
+                
+                // Check if we've been below threshold for the required time
+                if (liveData.lowForceCounter >= LOW_FORCE_COUNT_THRESHOLD) {
+                    // Record break data
+                    liveData.breakPosition_mm = liveData.currentPosition_mm - liveData.testStartPosition_mm;
+                    liveData.breakForce_N = liveData.currentForce_N;
+                    liveData.breakTime_us = esp_timer_get_time();
+                    liveData.breakDetected = true;
+                    
+                    stopTest();
+                    Serial.printf("Test auto-ended: Force stayed below %.0fN for %.1fs (peak was %.1fN)\n", 
+                                LOW_FORCE_THRESHOLD, LOW_FORCE_TIMEOUT_MS / 1000.0f, liveData.peakForce_N);
+                }
+            } else {
+                // Reset counter if force goes back above threshold OR if we haven't reached the initial threshold yet
+                liveData.lowForceCounter = 0;
+            }
+        }
+        
+        // Handle tare requests
+        EventBits_t bits = xEventGroupGetBits(testEventFlags);
+        if (bits & EVT_TARE_REQUEST) {
+            performTare();
+            xEventGroupClearBits(testEventFlags, EVT_TARE_REQUEST);
+        }
+        
+        vTaskDelayUntil(&lastWakeTime, frequency);
+    }
+}
+
+// ===== SERIAL COMMAND HANDLING =====
+void handleSerialCommand(String command) {
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "help") {
+        Serial.println("\n=== UTM CONTROLLER COMMANDS ===");
+        Serial.println("calibrate - Interactive calibration wizard");
+        Serial.println("tare - Zero the scale");
+        Serial.println("measure [samples] - Measurement accuracy test (default: 100)");
+        Serial.println("setgain <gain> - Set gain permanently (1,2,4,8,16,32,64,128)");
+        Serial.println("diag - NAU7802 communication diagnostics");
+        Serial.println("wifi - Show WiFi connection info");
+        Serial.println("status - Show system status");
+        Serial.println("reset - Restart ESP32");
+        Serial.println("==================================\n");
+    }
+    else if (command == "calibrate") {
+        if (loadCellAvailable) {
+            // Interactive calibration wizard
+            Serial.println("\n=== LOAD CELL CALIBRATION ===");
+            Serial.println("Step 1: Remove all weight from load cell");
+            Serial.println("Press Enter when ready...");
+            
+            while (Serial.available()) Serial.read();
+            while (Serial.available() == 0) delay(10);
+            
+            // Zero calibration with improved reliability
+            int32_t zeroTotal = 0;
+            int zeroValidReadings = 0;
+            int attempts = 0;
+            const int maxAttempts = 200;
+            
+            Serial.println("Taking zero readings...");
+            while (zeroValidReadings < 32 && attempts < maxAttempts) {
+                delay(25);
+                attempts++;
+                
+                uint32_t startWait = millis();
+                while (!myScale.available() && (millis() - startWait < 50)) {
+                    delay(1);
+                }
+                
+                if (myScale.available()) {
+                    int32_t reading = myScale.getReading();
+                    if (abs(reading) < 16000000) { // Sanity check
+                        zeroTotal += reading;
+                        zeroValidReadings++;
+                        
+                        if (zeroValidReadings % 8 == 0) {
+                            Serial.printf("Zero progress: %d/32 readings (raw: %ld)\n", 
+                                        zeroValidReadings, reading);
+                        }
+                    }
+                }
+            }
+            
+            if (zeroValidReadings < 16) {
+                Serial.printf("Zero calibration failed - only got %d readings\n", zeroValidReadings);
+                Serial.println("Check NAU7802 connections and try 'measure 50' to test communication");
+                return;
+            }
+            
+            int32_t zeroOffset = zeroTotal / zeroValidReadings;
+            myScale.setZeroOffset(zeroOffset);
+            Serial.printf("Zero offset set: %ld (from %d readings)\n", zeroOffset, zeroValidReadings);
+            
+            // Weight calibration
+            Serial.println("\nStep 2: Apply known load");
+            Serial.println("Press Enter when load is stable...");
+            
+            while (Serial.available()) Serial.read();
+            while (Serial.available() == 0) delay(10);
+            
+            Serial.print("Enter load value (kg): ");
+            String weightStr = "";
+            while (weightStr.length() == 0) {
+                while (Serial.available() == 0) delay(10);
+                weightStr = Serial.readStringUntil('\n');
+                weightStr.trim();
+            }
+            
+            float knownWeight = weightStr.toFloat();
+            if (knownWeight <= 0) {
+                Serial.println("Invalid weight value");
+                return;
+            }
+            
+            // Take calibration readings with improved reliability
+            int32_t total = 0;
+            int validReadings = 0;
+            attempts = 0;
+            
+            Serial.printf("Taking calibration readings for %.2f kg load...\n", knownWeight);
+            while (validReadings < 32 && attempts < maxAttempts) {
+                delay(25);
+                attempts++;
+                
+                uint32_t startWait = millis();
+                while (!myScale.available() && (millis() - startWait < 50)) {
+                    delay(1);
+                }
+                
+                if (myScale.available()) {
+                    int32_t reading = myScale.getReading();
+                    if (abs(reading) < 16000000) { // Sanity check
+                        total += reading;
+                        validReadings++;
+                        
+                        if (validReadings % 8 == 0) {
+                            Serial.printf("Cal progress: %d/32 readings (raw: %ld)\n", 
+                                        validReadings, reading);
+                        }
+                    }
+                }
+            }
+            
+            if (validReadings < 16) {
+                Serial.printf("Calibration failed - only got %d readings\n", validReadings);
+                return;
+            }
+            
+            float averageReading = (float)total / validReadings;
+            float calibrationFactor = -((averageReading - zeroOffset) / knownWeight);
+            
+            if (calibrationFactor == 0.0f || isnan(calibrationFactor)) {
+                Serial.println("Invalid calibration factor calculated");
+                return;
+            }
+            
+            myScale.setCalibrationFactor(calibrationFactor);
+            saveCalibration();
+            liveData.scaleCalibrated = true;
+            
+            Serial.printf("\nCalibration complete!\n");
+            Serial.printf("Factor: %.8f\n", calibrationFactor);
+            Serial.printf("Zero: %ld\n", zeroOffset);
+            Serial.printf("Gain: %dx\n", currentGainSetting);
+            
+            // Test the calibration
+            Serial.println("Testing calibration...");
+            delay(1000);
+            for (int i = 0; i < 3; i++) {
+                float testForce = getForceN();
+                Serial.printf("Test reading %d: %.2f N (%.3f kg)\n", 
+                             i+1, testForce, testForce / 9.81f);
+                delay(500);
+            }
+        }
+    }
+    else if (command == "tare") {
+        performTare();
+    }
+    else if (command == "diag") {
+        Serial.println("\n=== NAU7802 DIAGNOSTICS ===");
+        
+        if (!loadCellAvailable) {
+            Serial.println("Load cell not available");
+            return;
+        }
+        
+        // Test basic I2C communication
+        Wire.beginTransmission(0x2A);
+        uint8_t error = Wire.endTransmission();
+        Serial.printf("I2C communication: %s\n", error == 0 ? "OK" : "FAILED");
+        
+        if (error != 0) {
+            Serial.println("Check I2C wiring: SDA, SCL, VCC, GND");
+            return;
+        }
+        
+        // Test data availability and reading
+        int availableCount = 0;
+        int readingCount = 0;
+        int32_t readings[10];
+        
+        Serial.println("Testing data availability (10 attempts):");
+        for (int i = 0; i < 10; i++) {
+            delay(100);
+            
+            if (myScale.available()) {
+                availableCount++;
+                int32_t reading = myScale.getReading();
+                readings[readingCount] = reading;
+                readingCount++;
+                Serial.printf("  %d: Available, Raw=%ld\n", i+1, reading);
+            } else {
+                Serial.printf("  %d: Not available\n", i+1);
+            }
+        }
+        
+        Serial.printf("Results: %d/10 available, %d readings obtained\n", 
+                     availableCount, readingCount);
+        
+        if (readingCount > 5) {
+            // Calculate basic statistics
+            int32_t minVal = readings[0], maxVal = readings[0];
+            for (int i = 1; i < readingCount; i++) {
+                if (readings[i] < minVal) minVal = readings[i];
+                if (readings[i] > maxVal) maxVal = readings[i];
+            }
+            Serial.printf("Reading range: %ld to %ld (span: %ld)\n", 
+                         minVal, maxVal, maxVal - minVal);
+            
+            // Check for saturation
+            if (abs(minVal) > 8000000 || abs(maxVal) > 8000000) {
+                Serial.println("WARNING: Readings near saturation");
+            }
+        }
+        
+        // Show current settings
+        Serial.printf("Current gain: %dx\n", currentGainSetting);
+        if (liveData.scaleCalibrated) {
+            Serial.printf("Calibration factor: %.8f\n", myScale.getCalibrationFactor());
+            Serial.printf("Zero offset: %ld\n", myScale.getZeroOffset());
+        } else {
+            Serial.println("Not calibrated");
+        }
+        
+        Serial.println("=== DIAGNOSTICS COMPLETE ===\n");
+    }
+    else if (command.startsWith("measure")) {
+        int samples = 100;
+        if (command.length() > 8) {
+            samples = command.substring(8).toInt();
+        }
+        if (samples > 500) samples = 500; // Limit to prevent memory issues
+        
+        Serial.printf("\n=== MEASUREMENT TEST (%d samples) ===\n", samples);
+        
+        if (!liveData.scaleCalibrated) {
+            Serial.println("Scale not calibrated");
+            return;
+        }
+        
+        float total = 0;
+        int validSamples = 0;
+        int attempts = 0;
+        const int maxAttempts = samples * 3; // Allow some failures
+        
+        Serial.println("Starting measurement test...");
+        
+        while (validSamples < samples && attempts < maxAttempts) {
+            delay(50);
+            attempts++;
+            
+            // Wait for scale data with timeout
+            uint32_t startWait = millis();
+            while (!myScale.available() && (millis() - startWait < 50)) {
+                delay(1);
+            }
+            
+            if (myScale.available()) {
+                float force = getForceN();
+                if (!liveData.scaleError && !liveData.sensorSaturated) {
+                    total += force;
+                    validSamples++;
+                    
+                    if (validSamples % 20 == 0) {
+                        Serial.printf("Progress: %d/%d (%.1f N)\n", 
+                                     validSamples, samples, force);
+                    }
+                }
+            }
+        }
+        
+        if (validSamples > 0) {
+            float average = total / validSamples;
+            Serial.printf("Results:\n");
+            Serial.printf("  Average force: %.3f N (%.3f kg)\n", average, average / 9.81f);
+            Serial.printf("  Valid samples: %d/%d (%.1f%% success)\n", 
+                         validSamples, samples, (validSamples * 100.0f) / samples);
+            Serial.printf("  Total attempts: %d\n", attempts);
+            
+            if (validSamples < samples * 0.8) {
+                Serial.println("WARNING: High failure rate - check NAU7802 communication");
+                Serial.println("Try 'diag' command for more details");
+            }
+        } else {
+            Serial.println("FAILED: No valid readings obtained");
+            Serial.println("Run 'diag' command to check NAU7802 status");
+        }
+        
+        Serial.println("=== MEASUREMENT COMPLETE ===\n");
+    }
+    else if (command.startsWith("setgain")) {
+        int gain = command.substring(8).toInt();
+        
+        bool gainSet = false;
+        switch (gain) {
+            case 1: gainSet = myScale.setGain(NAU7802_GAIN_1); break;
+            case 2: gainSet = myScale.setGain(NAU7802_GAIN_2); break;
+            case 4: gainSet = myScale.setGain(NAU7802_GAIN_4); break;
+            case 8: gainSet = myScale.setGain(NAU7802_GAIN_8); break;
+            case 16: gainSet = myScale.setGain(NAU7802_GAIN_16); break;
+            case 32: gainSet = myScale.setGain(NAU7802_GAIN_32); break;
+            case 64: gainSet = myScale.setGain(NAU7802_GAIN_64); break;
+            case 128: gainSet = myScale.setGain(NAU7802_GAIN_128); break;
+            default:
+                Serial.printf("Invalid gain %d. Valid: 1,2,4,8,16,32,64,128\n", gain);
+                return;
+        }
+        
+        if (gainSet) {
+            currentGainSetting = gain;
+            EEPROM.put(LOCATION_GAIN_SETTING, currentGainSetting);
+            EEPROM.commit();
+            myScale.calibrateAFE();
+            Serial.printf("Gain set to %dx and saved\n", gain);
+        } else {
+            Serial.printf("Failed to set gain to %dx\n", gain);
+        }
+    }
+    else if (command == "wifi") {
+        Serial.println("\n=== WIFI INFORMATION ===");
+        Serial.printf("SSID: %s\n", apSSID.c_str());
+        Serial.printf("Password: %s\n", apPassword.c_str());
+        Serial.printf("IP Address: %s\n", WiFi.softAPIP().toString().c_str());
+        Serial.println("Open web browser and navigate to the IP address");
+        Serial.println("=========================\n");
+    }
+    else if (command == "status") {
+        Serial.println("\n=== SYSTEM STATUS ===");
+        Serial.printf("Load Cell: %s\n", liveData.scaleCalibrated ? "Calibrated" : "Not calibrated");
+        Serial.printf("SD Card: %s\n", liveData.sdCardAvailable ? "Available" : "Not available");
+        Serial.printf("Current force: %.2f N\n", liveData.currentForce_N);
+        Serial.printf("Current position: %.3f mm\n", liveData.currentPosition_mm);
+        Serial.printf("Test active: %s\n", liveData.testActive ? "Yes" : "No");
+        if (liveData.scaleCalibrated) {
+            Serial.printf("Cal Factor: %.8f\n", myScale.getCalibrationFactor());
+            Serial.printf("Zero Offset: %ld\n", myScale.getZeroOffset());
+            Serial.printf("Gain: %dx\n", currentGainSetting);
+        }
+        Serial.println("====================\n");
+    }
+    else if (command == "reset") {
+        Serial.println("Restarting system...");
+        delay(100);
+        esp_restart();
+    }
+    else {
+        Serial.printf("Unknown command: '%s'. Type 'help' for available commands.\n", command.c_str());
+    }
+}
+
+// ===== SETUP FUNCTION =====
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\nESP32 Universal Testing Machine - WiFi Control");
+    Serial.println("================================================");
+    Serial.println("ENHANCED: New test end logic, absolute force values, live current force display");
+    Serial.println("ENHANCED: Auto-end logic only activates after reaching meaningful force threshold");
+
+    // Initialize EEPROM
+    EEPROM.begin(EEPROM_SIZE);
+    Serial.println("EEPROM initialized");
+
+    // Initialize Event Groups
+    testEventFlags = xEventGroupCreate();
+    if (testEventFlags == NULL) {
+        Serial.println("Failed to create event group!");
+        while(1) delay(1000);
+    }
+
+    // GPIO initialization
+    pinMode(STEP, OUTPUT);
+    pinMode(DIR, OUTPUT);
+    pinMode(EN, OUTPUT);
+    digitalWrite(STEP, LOW);
+    digitalWrite(DIR, HIGH);
+    digitalWrite(EN, LOW);
+    Serial.println("GPIO initialized");
+
+    // Initialize I2C and Load Cell
+    Wire.begin();
+    Wire.setClock(100000);
+    delay(200);
+
+    Serial.println("Initializing NAU7802 load cell...");
+    loadCellAvailable = initLoadCell();
+    
+    if (loadCellAvailable) {
+        liveData.scaleCalibrated = loadCalibration();
+        Serial.printf("Load cell ready (Calibrated: %s)\n", 
+                     liveData.scaleCalibrated ? "Yes" : "No");
+    } else {
+        Serial.println("Load cell initialization failed");
+    }
+
+    // Initialize SD Card
+    liveData.sdCardAvailable = initializeSDCard();
+
+    // Start WiFi Access Point
+    Serial.println("Starting WiFi Access Point...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+    
+    IPAddress IP = WiFi.softAPIP();
+    Serial.printf("AP SSID: %s\n", apSSID.c_str());
+    Serial.printf("AP Password: %s\n", apPassword.c_str());
+    Serial.printf("AP IP address: %s\n", IP.toString().c_str());
+
+    // Start DNS server for captive portal
+    dnsServer.start(53, "*", IP);
+    Serial.println("DNS server started for captive portal");
+
+    // Setup web server routes
+    server.on("/", handleRoot);
+    server.on("/api/data", handleGetData);
+    server.on("/api/calibration", handleCalibration);
+    server.on("/api/command", handleCommand);
+    server.on("/export", handleExport);
+    server.on("/api/files", handleFileList);
+    server.on("/download", handleDownload);
+    
+    // Captive portal detection routes
+    server.on("/generate_204", handleCaptivePortalDetection);  // Android
+    server.on("/fwlink", handleCaptivePortalDetection);        // Microsoft
+    server.on("/hotspot-detect.html", handleCaptivePortalDetection);  // Apple
+    server.on("/connectivity-check.html", handleCaptivePortalDetection);  // Firefox
+    server.on("/check_network_status.txt", handleCaptivePortalDetection);  // Firefox
+    server.on("/ncsi.txt", handleCaptivePortalDetection);      // Windows
+    
+    server.onNotFound(handleNotFound);
+
+    server.begin();
+    Serial.println("Web server started with captive portal support");
+
+    // Create data acquisition task
+    xTaskCreatePinnedToCore(dataAcquisitionTask, "DataTask", 8192, NULL, 2, &dataTaskHandle, 1);
+    Serial.println("Data acquisition task created");
+
+    Serial.println("\nSystem initialization complete!");
+    Serial.println("Connect to WiFi and open web browser to control the system");
+    Serial.println("Use 'wifi' command to see connection details");
+    Serial.println("Use 'help' command to see available serial commands");
+    Serial.printf("ENHANCED FEATURES:\n");
+    Serial.printf("- Only Modulus test mode available\n");
+    Serial.printf("- Test auto-ends when force < %.0fN for %.1fs (after reaching %.0fN)\n", 
+                  LOW_FORCE_THRESHOLD, LOW_FORCE_TIMEOUT_MS / 1000.0f, TEST_FORCE_THRESHOLD);
+    Serial.printf("- Force readings always positive (absolute values)\n");
+    Serial.printf("- Live current force display during testing\n");
+    
+    if (!liveData.scaleCalibrated) {
+        Serial.println("\nNext step: Use 'calibrate' command to calibrate load cell");
+    }
+}
+
+// ===== MAIN LOOP =====
+void loop() {
+    // Handle DNS server for captive portal
+    dnsServer.processNextRequest();
+    
+    // Handle web server
+    server.handleClient();
+    
+    // Handle serial commands
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        handleSerialCommand(command);
+    }
+    
+    delay(10);
+}
